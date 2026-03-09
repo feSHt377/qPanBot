@@ -1,11 +1,13 @@
 #全自动q群文件网盘管理
 import asyncio
+import json
 import os
 import re
+import time
 from types import SimpleNamespace
 
 import httpx
-from nonebot import on_command, on_message, on_notice
+from nonebot import get_driver, on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import Bot, Event, Message
 from nonebot.params import CommandArg
 from nonebot.typing import T_State
@@ -86,7 +88,7 @@ async def set_qpan_file_forever(bot: Bot, file_size : int, file_name: str, group
             files = await get_qpan_files(bot) # type: ignore 获取当前群盘文件列表
             target_file = next((f for f in files if f["file_name"] == file_name and f["file_size"] == file_size and f["group_id"] == group_id), None) # type: ignore # 找到对应的文件信息
             if target_file is None:
-                raise ValueError(f"未在群 {group_id} 中找到文件 {file_name}（大小 {file_size}），可能尚未同步")  # noqa: TRY003
+                raise ValueError(f"未在群 {group_id} 中找到文件 {file_name}（大小 {file_size}），可能尚未同步")  # noqa: TRY003, TRY301
             await bot.set_group_file_forever(file_id=target_file["file_id"], group_id=group_id) # type: ignore
             break  # 成功则跳出重试循环
         except Exception as e:
@@ -102,23 +104,42 @@ async def set_qpan_file_forever(bot: Bot, file_size : int, file_name: str, group
 
     return False # 如果没有找到对应的文件，返回False表示设置失败
 
-async def send_file_to_group(bot: Bot, group_id: int, file_id: str, file_name: str, file_size: int = 0):
-    # 发送文件到指定群
-    try:
-        # 文件名不包含中文，直接使用CQ码发送
-        file_url = (await bot.get_group_file_url(file_id=file_id, group_id=group_id))["url"] # type: ignore
+async def send_file_to_group(bot: Bot, group_id: int, file_id: str) -> bool:
+    """通过转发原始消息将文件发送到目标群，不触发下载"""
+    info = file_messages.get(file_id)  # type: ignore
+    if info is None:
+        print(f"未找到 file_id={file_id} 的原始消息记录，无法转发（仅支持通过聊天框发送的文件，文件面板上传不产生消息事件）")
 
-        #cq码这样传参就可以带中文了，太好了！！！
-        await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file={file_name},url=,file_id={file_id},path={file_url},file_size={file_size}]") # type: ignore # 发送文件消息
+        files = await get_qpan_files(bot) # type: ignore # 尝试刷新文件列表，可能会更新 file_messages 中的记录
+        file_url = None
+        file_name_fallback = file_id  # 兜底文件名
+        for file in files:
+            if file["file_id"] == file_id : # type: ignore
+                file_url = (await bot.get_group_file_url(file_id=file_id, group_id=file["group_id"]))["url"] # type: ignore
+                file_name_fallback = file["file_name"]  # type: ignore
+        if file_url is None:
+            await bot.send_group_msg(group_id=group_id, message=f"未找到 file_id={file_id} ,是否从未上传过？") # type: ignore
+            return False
+        await bot.send_group_msg(group_id=group_id, message=f"未找到 file_id={file_id} 的原始消息记录，无法转发，开始重新下载上传") # type: ignore
+        # await bot.upload_group_file(group_id=group_id, file=file_url, name=file_name_fallback) # type: ignore
+        # await download_file_by_url(file_url, file_name_fallback) # type: ignore
 
+        #创建transfer_file_to_free_group任务
+        asyncio.create_task(transfer_file_to_free_group(bot, file_id, group_id, file_name_fallback, 0)) # type: ignore # 直接调用转移函数，文件大小未知暂时传0，转移函数会处理下载和上传到有空间的群盘
+
+        # await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file_id={file_id},file={file_name_fallback},url=,path={file_url}]") # type: ignore
+        return False
+    try: # == else: try:
+        await bot.forward_group_single_msg(group_id=group_id, message_id=info["message_id"])  # type: ignore
+        return True  # noqa: TRY300
     except Exception as e:
-        print(f"发送文件失败：{e}")
+        print(f"转发文件失败：{e}")
         return False
 
-DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "downloads")
+DOWNLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-#弃用
+
 async def download_file_by_url(url: str, file_name: str) -> str:
     """通过 HTTP 直接下载文件到本地 downloads 目录"""
     print(f"开始下载文件到{DOWNLOAD_DIR}：{file_name}，URL: {url}")
@@ -140,11 +161,11 @@ async def download_file_by_url(url: str, file_name: str) -> str:
     return file_path
 
 
-#弃用
-async def transfer_file_to_free_group(bot: Bot, event: Event, group_id: int, file_name: str, file_size: int):
+
+async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, file_name: str, file_size: int):
     """后台执行文件转移：直接 HTTP 下载 -> 上传到有空间的群盘"""
     try:
-        file_url = (await bot.get_group_file_url(file_id=event.file.id, group_id=group_id))["url"] # type: ignore
+        file_url = (await bot.get_group_file_url(file_id=file_id, group_id=group_id))["url"] # type: ignore
         file_path = await download_file_by_url(file_url, file_name)
 
         free_group_id = await get_qpan_group_with_enough_space(bot, file_size) # type: ignore
@@ -176,15 +197,10 @@ async def handle_group_upload(bot: Bot, event: Event):
         file_name = event.file.name # type: ignore
         file_size = event.file.size # type: ignore
 
-        # file_url = (await bot.get_group_file_url(file_id=event.file.id, group_id=group_id))["url"] # type: ignore
-
-        #这样传参就可以带中文了，太好了！！！
-        # await file_upload.send(Message(f"[CQ:file,file={file_name},url=,file_id={event.file.id},path={file_url},file_size={file_size}]")) # type: ignore # 发送初始通知消息
-        # await send_file_to_group(bot, group_id, event.file.id, file_name, file_size) # type: ignore # 发送文件消息到群，触发转发功能
-
         current_qpan_info = await get_qpan_file_info(bot, group_id) # type: ignore # 获取当前群盘信息以计算剩余空间
         await file_upload.send(f"检测到群 {group_id} 中用户 {user_id} 上传了文件 {file_name}，大小为 {file_size} 字节，file_id: {event.file.id}，当前群盘使用率：{int(current_qpan_info.used_space/current_qpan_info.total_space * 100)}% ，是否足够？ {current_qpan_info.total_space - current_qpan_info.used_space >= file_size}") # type: ignore # 发送通知消息
-
+        # 等待 handle_message 捕获用户发送的原始文件消息（notice 与 message 事件几乎同时到达，稍等即可）
+        await asyncio.sleep(1)
 
         if current_qpan_info.total_space - current_qpan_info.used_space < file_size or file_name == "test.txt": # 如果剩余空间不足以存储新文件
             if file_name == "test.txt":
@@ -195,9 +211,11 @@ async def handle_group_upload(bot: Bot, event: Event):
             free_group_id = await get_qpan_group_with_enough_space(bot, file_size) # type: ignore # 查找一个剩余空间足够的群盘
             if free_group_id:
                 await file_upload.send(f"找到空闲群盘 {free_group_id}，正在转移文件 {file_name}...") # type: ignore 发送找到空闲群盘的消息
-                await send_file_to_group(bot, free_group_id, event.file.id, file_name, file_size) # type: ignore # 发送文件消息到群，触发转发功能
-
-                await file_upload.send(f"已上传{file_name}至{free_group_id},正在转为永久文件") # type: ignore 发送转移中的消息
+                if await send_file_to_group(bot, free_group_id, event.file.id): # type: ignore
+                    await file_upload.send(f"已转发 {file_name} 至 {free_group_id}，正在转为永久文件") # type: ignore
+                else:
+                    await file_upload.send(f"转发失败：未找到 {file_name} 的原始消息（仅聊天框拖入的文件支持转发，文件面板上传不支持）") # type: ignore
+                    return
 
                 if await set_qpan_file_forever(bot, file_size=file_size, file_name=file_name, group_id=free_group_id) :# type: ignore # 尝试设置新上传的文件为永久保存
                     await file_upload.send(f"已自动设置文件 {file_name} 为永久保存！") # type: ignore # 发送成功消息
@@ -276,13 +294,18 @@ async def cmd_remove(bot, event, sub_args):
     sub_args[0] if sub_args else ""
     await qpan.finish("删除功能尚未实现")
 
+async def cmd_refresh(bot, event, sub_args):
+    await qpan.send(f"开始刷新，共 {len(file_messages)} 条记录，超过 {REFRESH_AFTER_DAYS} 天的将被重新转发...")
+    await _do_refresh_file_messages()
+    await qpan.finish("刷新完成")
+
 async def cmd_get(bot, event, sub_args):
     file_id = sub_args[0] if sub_args else ""
     file_list = await get_qpan_files(bot) # type: ignore
     target_file = next((f for f in file_list if f["file_id"] == file_id), None) # type: ignore # next函数会返回第一个满足条件的文件对象，如果没有找到则返回None
     if target_file:
-        await send_file_to_group(bot, event.group_id, target_file["file_id"], target_file["file_name"], target_file["file_size"]) # type: ignore # 发送文件消息到当前群
-        await qpan.finish(f"已发送文件 {target_file['file_name']} 到当前群！") # type: ignore # 发送成功消息
+        await qpan.send(f"正在发送文件 {target_file['file_name']} 到当前群！") # type: ignore
+        await send_file_to_group(bot, event.group_id, target_file["file_id"]) # type: ignore
     else:
         await qpan.finish("未找到指定文件")
 
@@ -295,6 +318,7 @@ SUB_COMMANDS = {
     "set" : None, "设置" : None, # 预留设置命令
     "remove" : None, "删除" : None, # 预留删除命令
     "get" : cmd_get , "获取" : cmd_get , # 预留获取文件命令
+    "refresh" : cmd_refresh , "刷新" : cmd_refresh , # 手动触发消息刷新
 }
 
 @qpan.handle()
@@ -315,8 +339,76 @@ async def handle_qpan(bot: Bot, event: Event, state: T_State, args: Message = Co
 
 msg = on_message(priority=10)
 
-file_messages: dict[str, int] = {}  # file_id -> message_id，最多保留100条，超出时丢弃最旧的
+FILE_MESSAGES_PATH = os.path.join(os.path.dirname(__file__), "file_messages.json")
 FILE_MESSAGES_MAX = 100
+REFRESH_INTERVAL_HOURS = 1 # 每隔多少小时检查一次
+REFRESH_AFTER_DAYS = 0.5    # 消息超过几天则重新转发刷新
+
+# REFRESH_INTERVAL_HOURS = 0.0038 # 每隔多少小时检查一次
+# REFRESH_AFTER_DAYS = 0    # test 设置为0表示每条消息都刷新，实际使用时建议设置为3天以上，避免频繁刷新导致的性能问题和可能的频率限制
+
+def _load_file_messages() -> dict[str, dict]:
+    try:
+        with open(FILE_MESSAGES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        # 兼容旧格式（直接存储整数 message_id）
+        return {
+            fid: (info if isinstance(info, dict) else {"message_id": info, "timestamp": 0.0, "group_id": 0})
+            for fid, info in data.items()
+        }
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_file_messages() -> None:
+    with open(FILE_MESSAGES_PATH, "w", encoding="utf-8") as f:
+        json.dump(file_messages, f, ensure_ascii=False, indent=2)
+
+async def _do_refresh_file_messages() -> None:
+    """将超过 REFRESH_AFTER_DAYS 天的记录重新转发到原群，handle_message 会自动更新 timestamp"""
+    try:
+        from nonebot import get_bot  # noqa: PLC0415
+        bot = get_bot()
+    except Exception:
+        print("刷新文件消息：未找到可用的 bot 实例")
+        return
+    now = time.time()
+    expired = [(fid, info) for fid, info in list(file_messages.items())
+               if now - info.get("timestamp", 0) > REFRESH_AFTER_DAYS * 86400]
+    if not expired:
+        return
+    print(f"开始刷新 {len(expired)} 条过期文件消息...")
+    for file_id, info in expired:
+        if not info.get("group_id"):
+            print(f"跳过 file_id={file_id}：无有效 group_id")
+            continue
+        try:
+            message_id = (await bot.forward_group_single_msg(group_id=info["group_id"], message_id=info["message_id"]))["message_id"]  # type: ignore
+
+            info["message_id"] = message_id
+            info["timestamp"] = time.time()
+            _save_file_messages()
+            print(f"已转发刷新 file_id={file_id}")
+        except Exception as e:
+            print(f"刷新 file_id={file_id} 失败：{e}")
+        await asyncio.sleep(1)  # 避免频率限制
+
+async def _refresh_loop() -> None:
+    last_refresh = time.time()
+    while True:
+        await asyncio.sleep(5)  # 每分钟检查一次
+        if time.time() - last_refresh >= REFRESH_INTERVAL_HOURS * 3600:
+            await _do_refresh_file_messages()
+            last_refresh = time.time()
+        # else:
+        #     print(f"距离下次刷新还有 {(REFRESH_INTERVAL_HOURS * 3600 - (time.time() - last_refresh)) / 60:.2f} 分钟")
+
+driver = get_driver()
+
+@driver.on_startup
+async def _start_refresh_task() -> None:
+    asyncio.create_task(_refresh_loop())
+
+file_messages: dict[str, dict] = _load_file_messages()  # file_id -> {message_id, timestamp, group_id}
 
 
 @msg.handle()
@@ -324,19 +416,25 @@ async def handle_message(bot: Bot, event: Event):
     # if event.get_message()
     print(f"收到消息：{event.get_message()}") # 打印收到的消息内容以调试
 
-    
-
     #sample [CQ:file,file=vfcompat.dll,url=,file_id=/c56bcc83-678b-4454-8bab-c6eb99b0dc6d,path=,file_size=68104]
     if "[CQ:file," in event.raw_message: # type: ignore
         match = re.search(r"file_id=([^,\]]+)", event.raw_message) # type: ignore
         if match:
             file_id = match.group(1)
             print(f"提取到 file_id：{file_id}")
+            file_name_match = re.search(r"(?<!\w)file=([^,\]]+)", event.raw_message)  # type: ignore
+            file_name = file_name_match.group(1) if file_name_match else ""
             if len(file_messages) >= FILE_MESSAGES_MAX:
                 # 超出上限时删除最旧的一条
                 oldest_key = next(iter(file_messages))
                 del file_messages[oldest_key]
-            file_messages[file_id] = event.message_id  # type: ignore
+            file_messages[file_id] = {
+                "message_id": event.message_id,  # type: ignore
+                "timestamp": time.time(),
+                "group_id": getattr(event, "group_id", 0),
+                "file_name": file_name,
+            }
+            _save_file_messages()
             await msg.send(f"已记录文件消息，file_id: {file_id}，message_id: {event.message_id}") # type: ignore
         # await bot.forward_group_single_msg(group_id=event.group_id, message_id=event.message_id) # type: ignore # 尝试将消息转发到另一个群，替换为实际的目标群ID
 
