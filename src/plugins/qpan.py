@@ -105,6 +105,9 @@ async def send_file_to_group(bot: Bot, group_id: int, file_id: str, file_name: s
         pinyin_filename = convert_chinese_to_pinyin(file_name)
         if pinyin_filename != file_name:
             # 此文件中包含中文，使用转发方法来保留原文件名，同时避开中文文件名无法使用cq码发送的特殊问题
+
+            await asyncio.sleep(1)  # 等待一段时间确保message适配器接收到文件消息并记录
+
             message_id = file_messages.get(file_id)  # type: ignore
             if message_id is not None:
                 await bot.forward_group_single_msg(group_id=group_id, message_id=message_id)  # type: ignore
@@ -180,7 +183,7 @@ async def handle_group_upload(bot: Bot, event: Event):
         file_size = event.file.size # type: ignore
 
         # await file_upload.send(f"[CQ:file,file={file_name},url=,file_id={event.file.id},path=,file_size={file_size}]") # type: ignore # 发送初始通知消息
-        await send_file_to_group(bot, group_id, event.file.id, file_name, file_size) # type: ignore # 发送文件消息到群，触发转发功能
+        # await send_file_to_group(bot, group_id, event.file.id, file_name, file_size) # type: ignore # 发送文件消息到群，触发转发功能
 
         current_qpan_info = await get_qpan_file_info(bot, group_id) # type: ignore # 获取当前群盘信息以计算剩余空间
         await file_upload.send(f"检测到群 {group_id} 中用户 {user_id} 上传了文件 {file_name}，大小为 {file_size} 字节，file_id: {event.file.id}，当前群盘使用率：{int(current_qpan_info.used_space/current_qpan_info.total_space * 100)}% ，是否足够？ {current_qpan_info.total_space - current_qpan_info.used_space >= file_size}") # type: ignore # 发送通知消息
