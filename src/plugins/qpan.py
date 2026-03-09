@@ -46,6 +46,10 @@ async def get_qpan_files(bot: Bot):
         for file in files:
             file["group_name"] = group["group_name"] # type: ignore # 给每个文件对象添加所属群名称属性
         file_list.extend(files) # 将每个群的文件列表合并到一个总列表中
+
+    # 按文件名排序（忽略大小写）
+    file_list.sort(key=lambda f: f["file_name"].lower())
+
     return file_list 
 
 # 获取群盘文件系统信息，计算总空间和已用空间
@@ -136,7 +140,7 @@ async def send_file_to_group(bot: Bot, group_id: int, file_id: str) -> bool:
         print(f"转发文件失败：{e}")
         return False
 
-DOWNLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "downloads"))
+DOWNLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "downloads"))  # noqa: PTH100
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
@@ -171,7 +175,16 @@ async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, f
         free_group_id = await get_qpan_group_with_enough_space(bot, file_size) # type: ignore
         if free_group_id:
             await bot.upload_group_file(group_id=free_group_id, file=file_path, name=file_name) # type: ignore
-            await bot.send_group_msg(group_id=group_id, message=f"文件 {file_name} 已成功转移到群 {free_group_id}！") # type: ignore
+            message_id = (await bot.send_group_msg(group_id=group_id, message=f"文件 {file_name} 已成功转移到群 {free_group_id}！"))["message_id"] # type: ignore
+            if message_id :
+                # 记录转移后的消息ID和时间戳，后续用于自动刷新
+                file_messages[file_id] = {
+                    "message_id": message_id,
+                    "timestamp": time.time(),
+                    "group_id": free_group_id,
+                    "file_name": file_name,
+                }
+                _save_file_messages()
         else:
             await bot.send_group_msg(group_id=group_id, message=f"警告：未找到剩余空间足够的群盘来存储文件 {file_name}，请管理员尽快清理空间！") # type: ignore
         # 清理临时文件
