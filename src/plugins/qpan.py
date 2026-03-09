@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 
 import httpx
-from nonebot import get_driver, on_command, on_message, on_notice
+from nonebot import get_driver, on, on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import Bot, Event, Message
 from nonebot.params import CommandArg
 from nonebot.typing import T_State
@@ -174,17 +174,18 @@ async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, f
 
         free_group_id = await get_qpan_group_with_enough_space(bot, file_size) # type: ignore
         if free_group_id:
-            await bot.upload_group_file(group_id=free_group_id, file=file_path, name=file_name) # type: ignore
-            message_id = (await bot.send_group_msg(group_id=group_id, message=f"文件 {file_name} 已成功转移到群 {free_group_id}！"))["message_id"] # type: ignore
-            if message_id :
-                # 记录转移后的消息ID和时间戳，后续用于自动刷新
-                file_messages[file_id] = {
-                    "message_id": message_id,
-                    "timestamp": time.time(),
-                    "group_id": free_group_id,
-                    "file_name": file_name,
-                }
-                _save_file_messages()
+            # await bot.upload_group_file(group_id=free_group_id, file=file_path, name=file_name) # type: ignore
+            await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file_id={file_id},file={file_name},url=,path={file_path}]")
+            await bot.send_group_msg(group_id=group_id, message=f"文件 {file_name} 已成功转移到群 {free_group_id}！") # type: ignore
+            # if message_id :
+            #     # 记录转移后的消息ID和时间戳，后续用于自动刷新
+            #     file_messages[file_id] = {
+            #         "message_id": message_id,
+            #         "timestamp": time.time(),
+            #         "group_id": free_group_id,
+            #         "file_name": file_name,
+            #     }
+            #     _save_file_messages()
         else:
             await bot.send_group_msg(group_id=group_id, message=f"警告：未找到剩余空间足够的群盘来存储文件 {file_name}，请管理员尽快清理空间！") # type: ignore
         # 清理临时文件
@@ -201,7 +202,7 @@ async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, f
 file_upload = on_notice()
 
 @file_upload.handle()
-async def handle_group_upload(bot: Bot, event: Event):
+async def handle_group_upload(bot: Bot, event: Event ):
     event_type = event.notice_type # type: ignore
     print(f"收到事件：{event_type}") # 打印事件类型以调试
     if event_type == "group_upload": # 监听群文件上传事件
@@ -371,6 +372,7 @@ async def handle_qpan(bot: Bot, event: Event, state: T_State, args: Message = Co
 
 
 msg = on_message(priority=10)
+self_msg = on()
 
 FILE_MESSAGES_PATH = os.path.join(os.path.dirname(__file__), "file_messages.json")
 FILE_MESSAGES_MAX = 100
@@ -444,25 +446,24 @@ async def _start_refresh_task() -> None:
 file_messages: dict[str, dict] = _load_file_messages()  # file_id -> {message_id, timestamp, group_id}
 
 
-@msg.handle()
-async def handle_message(bot: Bot, event: Event):
-    # if event.get_message()
-    print(f"收到消息：{event.get_message()}") # 打印收到的消息内容以调试
+def _record_file_message(raw_message: str) -> None:
+    """从消息事件中提取文件 CQ 码并记录映射关系。"""
+    print(f"收到消息：{raw_message}") # 打印收到的消息内容以调试
 
     #sample [CQ:file,file=vfcompat.dll,url=,file_id=/c56bcc83-678b-4454-8bab-c6eb99b0dc6d,path=,file_size=68104]
-    if "[CQ:file," in event.raw_message: # type: ignore
-        match = re.search(r"file_id=([^,\]]+)", event.raw_message) # type: ignore
+    if "[CQ:file," in raw_message:
+        match = re.search(r"file_id=([^,\]]+)", raw_message)
         if match:
             file_id = match.group(1)
             print(f"提取到 file_id：{file_id}")
-            file_name_match = re.search(r"(?<!\w)file=([^,\]]+)", event.raw_message)  # type: ignore
+            file_name_match = re.search(r"(?<!\w)file=([^,\]]+)", raw_message)
             file_name = file_name_match.group(1) if file_name_match else ""
             if len(file_messages) >= FILE_MESSAGES_MAX:
                 # 超出上限时删除最旧的一条
                 oldest_key = next(iter(file_messages))
                 del file_messages[oldest_key]
             file_messages[file_id] = {
-                "message_id": event.message_id,  # type: ignore
+                "message_id": getattr(event, "message_id", 0),
                 "timestamp": time.time(),
                 "group_id": getattr(event, "group_id", 0),
                 "file_name": file_name,
@@ -470,4 +471,22 @@ async def handle_message(bot: Bot, event: Event):
             _save_file_messages()
             # await msg.send(f"已记录文件消息，file_id: {file_id}，message_id: {event.message_id}") # type: ignore
         # await bot.forward_group_single_msg(group_id=event.group_id, message_id=event.message_id) # type: ignore # 尝试将消息转发到另一个群，替换为实际的目标群ID
+
+
+@msg.handle()
+async def handle_message(bot: Bot, event: Event):
+    user_id = getattr(event, "user_id", None)
+    is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
+    print(f"message 事件触发 (self={is_self_message})")
+    _record_file_message(event.raw_message) # type: ignore
+
+
+@self_msg.handle()
+async def handle_self_message(bot: Bot, event: Event):
+    if event.post_type != "message_sent":
+        return
+    user_id = getattr(event, "user_id", None)
+    is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
+    print(f"message_sent 事件触发 (self={is_self_message})")
+    _record_file_message(event.raw_message) # type: ignore
 
