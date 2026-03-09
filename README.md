@@ -22,7 +22,7 @@
 ## 🚀 快速启动
 
 ```bash
-pip install -e .
+nb run
 ```
 
 Windows 启动：
