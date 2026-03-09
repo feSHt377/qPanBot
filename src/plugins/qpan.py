@@ -278,6 +278,14 @@ async def cmd_info(bot, event, sub_args):
         f"\n共 {qpan_info.group_count} 个群盘，平均每个群盘使用空间：{(qpan_info.used_space/qpan_info.group_count)/1024/1024/1024:.2f} GB"
         )
 
+async def cmd_remove(bot, event, sub_args):
+    # 只提供file_id参数，后续可以增加更多的参数来提高准确性，例如文件名、大小、所属群等
+    file_id = sub_args[0] if sub_args else ""
+    await qpan.finish("删除功能尚未实现")
+
+async def cmd_get(bot, event, sub_args):
+    pass
+
 
 SUB_COMMANDS = {
     "help": cmd_help, "帮助": cmd_help,
@@ -285,6 +293,8 @@ SUB_COMMANDS = {
     "search": cmd_search, "搜索": cmd_search,
     "info" : cmd_info, "总盘" : cmd_info ,
     "set" : None, "设置" : None, # 预留设置命令
+    "remove" : None, "删除" : None, # 预留删除命令
+    "get" : cmd_get
 }
 
 @qpan.handle()
