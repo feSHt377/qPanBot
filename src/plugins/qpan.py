@@ -105,21 +105,11 @@ async def set_qpan_file_forever(bot: Bot, file_size : int, file_name: str, group
 async def send_file_to_group(bot: Bot, group_id: int, file_id: str, file_name: str, file_size: int = 0):
     # 发送文件到指定群
     try:
-        # 将中文文件名转换为拼音
-        pinyin_filename = convert_chinese_to_pinyin(file_name)
-        if pinyin_filename != file_name:
-            # 此文件中包含中文，使用转发方法来保留原文件名，同时避开中文文件名无法使用cq码发送的特殊问题
+        # 文件名不包含中文，直接使用CQ码发送
+        file_url = (await bot.get_group_file_url(file_id=file_id, group_id=group_id))["url"] # type: ignore
 
-            await asyncio.sleep(1)  # 等待一段时间确保message适配器接收到文件消息并记录
-
-            message_id = file_messages.get(file_id)  # type: ignore
-            if message_id is not None:
-                await bot.forward_group_single_msg(group_id=group_id, message_id=message_id)  # type: ignore
-            else:
-                print(f"未找到 file_id={file_id} 对应的消息记录，无法转发"  )
-        else:
-            # 文件名不包含中文，直接使用CQ码发送
-            await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file={file_name},url=,file_id={file_id},path=,file_size={file_size}]") # type: ignore # 发送文件消息
+        #cq码这样传参就可以带中文了，太好了！！！
+        await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file={file_name},url=,file_id={file_id},path={file_url},file_size={file_size}]") # type: ignore # 发送文件消息
 
     except Exception as e:
         print(f"发送文件失败：{e}")
@@ -186,7 +176,10 @@ async def handle_group_upload(bot: Bot, event: Event):
         file_name = event.file.name # type: ignore
         file_size = event.file.size # type: ignore
 
-        # await file_upload.send(f"[CQ:file,file={file_name},url=,file_id={event.file.id},path=,file_size={file_size}]") # type: ignore # 发送初始通知消息
+        # file_url = (await bot.get_group_file_url(file_id=event.file.id, group_id=group_id))["url"] # type: ignore
+
+        #这样传参就可以带中文了，太好了！！！
+        # await file_upload.send(Message(f"[CQ:file,file={file_name},url=,file_id={event.file.id},path={file_url},file_size={file_size}]")) # type: ignore # 发送初始通知消息
         # await send_file_to_group(bot, group_id, event.file.id, file_name, file_size) # type: ignore # 发送文件消息到群，触发转发功能
 
         current_qpan_info = await get_qpan_file_info(bot, group_id) # type: ignore # 获取当前群盘信息以计算剩余空间
@@ -280,11 +273,18 @@ async def cmd_info(bot, event, sub_args):
 
 async def cmd_remove(bot, event, sub_args):
     # 只提供file_id参数，后续可以增加更多的参数来提高准确性，例如文件名、大小、所属群等
-    file_id = sub_args[0] if sub_args else ""
+    sub_args[0] if sub_args else ""
     await qpan.finish("删除功能尚未实现")
 
 async def cmd_get(bot, event, sub_args):
-    pass
+    file_id = sub_args[0] if sub_args else ""
+    file_list = await get_qpan_files(bot) # type: ignore
+    target_file = next((f for f in file_list if f["file_id"] == file_id), None) # type: ignore # next函数会返回第一个满足条件的文件对象，如果没有找到则返回None
+    if target_file:
+        await send_file_to_group(bot, event.group_id, target_file["file_id"], target_file["file_name"], target_file["file_size"]) # type: ignore # 发送文件消息到当前群
+        await qpan.finish(f"已发送文件 {target_file['file_name']} 到当前群！") # type: ignore # 发送成功消息
+    else:
+        await qpan.finish("未找到指定文件")
 
 
 SUB_COMMANDS = {
@@ -294,7 +294,7 @@ SUB_COMMANDS = {
     "info" : cmd_info, "总盘" : cmd_info ,
     "set" : None, "设置" : None, # 预留设置命令
     "remove" : None, "删除" : None, # 预留删除命令
-    "get" : cmd_get
+    "get" : cmd_get , "获取" : cmd_get , # 预留获取文件命令
 }
 
 @qpan.handle()
