@@ -296,10 +296,29 @@ async def cmd_search(bot, event, sub_args):
     await qpan.finish(f"搜索：{keyword}，找到 {len(matching_files)} 个文件：\n" + "\n".join(f"{file['file_name']} (大小: {file['file_size']/1024/1024:.2f} MB，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , file_id: {file['file_id']})" for file in matching_files))
 
 async def cmd_info(bot, event, sub_args):
-    qpan_info = await get_qpan_file_info(bot) # type: ignore
+    # qpan_info = await get_qpan_file_info(bot) # type: ignore
+    qpan_groups = await get_qpan_groups(bot) # type: ignore
+
+    details = "\n"
+    used_space = 0
+    total_space = 0
+    qpan_groups.sort(key=lambda group: group["group_name"])
+    for group in qpan_groups:
+        re = SimpleNamespace(**await bot.get_group_file_system_info(group_id=group["group_id"])) # type: ignore
+        used_space += re.used_space
+        total_space += re.total_space
+        details += f"{group['group_name']} {group['group_id']}: {int(re.used_space/re.total_space * 100)}% ({re.used_space/1024/1024/1024:.2f} GB / {re.total_space/1024/1024/1024:.2f} GB)\n"
+    class QPanInfo:
+        def __init__(self, used_space, total_space, group_count):
+            self.used_space = used_space
+            self.total_space = total_space
+            self.group_count = group_count
+    qpan_info =QPanInfo(used_space, total_space, len(qpan_groups))
+
     # print(re)
     await qpan.finish(
-        f"网盘总空间：{int(qpan_info.used_space/qpan_info.total_space * 100)}% ({qpan_info.total_space/1024/1024/1024:.2f} GB，已用空间：{qpan_info.used_space/1024/1024/1024:.2f} GB) " +
+        f"网盘使用率：{int(qpan_info.used_space/qpan_info.total_space * 100)}% ({qpan_info.used_space/1024/1024/1024:.2f} GB / {qpan_info.total_space/1024/1024/1024:.2f} GB) " +
+        details +
         f"\n共 {qpan_info.group_count} 个群盘，平均每个群盘使用空间：{(qpan_info.used_space/qpan_info.group_count)/1024/1024/1024:.2f} GB"
         )
 
