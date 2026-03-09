@@ -214,6 +214,7 @@ async def handle_group_upload(bot: Bot, event: Event):
         await file_upload.send(f"检测到群 {group_id} 中用户 {user_id} 上传了文件 {file_name}，大小为 {file_size} 字节，file_id: {event.file.id}，当前群盘使用率：{int(current_qpan_info.used_space/current_qpan_info.total_space * 100)}% ，是否足够？ {current_qpan_info.total_space - current_qpan_info.used_space >= file_size}") # type: ignore # 发送通知消息
         # 等待 handle_message 捕获用户发送的原始文件消息（notice 与 message 事件几乎同时到达，稍等即可）
         await asyncio.sleep(1)
+        current_qpan_info = await get_qpan_file_info(bot, group_id) # type: ignore #刷新群盘信息，获取最新的剩余空间情况
 
         if current_qpan_info.total_space - current_qpan_info.used_space < file_size or file_name == "test.txt": # 如果剩余空间不足以存储新文件
             if file_name == "test.txt":
@@ -448,6 +449,6 @@ async def handle_message(bot: Bot, event: Event):
                 "file_name": file_name,
             }
             _save_file_messages()
-            await msg.send(f"已记录文件消息，file_id: {file_id}，message_id: {event.message_id}") # type: ignore
+            # await msg.send(f"已记录文件消息，file_id: {file_id}，message_id: {event.message_id}") # type: ignore
         # await bot.forward_group_single_msg(group_id=event.group_id, message_id=event.message_id) # type: ignore # 尝试将消息转发到另一个群，替换为实际的目标群ID
 
