@@ -146,36 +146,53 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 async def download_file_by_url(url: str, file_name: str) -> str:
     """通过 HTTP 直接下载文件到本地 downloads 目录"""
-    print(f"开始下载文件到{DOWNLOAD_DIR}：{file_name}，URL: {url}")
-    file_path = os.path.join(DOWNLOAD_DIR, file_name)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30, read=120, write=30, pool=30), follow_redirects=True) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
-            downloaded = 0
-            with open(file_path, "wb") as f:
-                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        print(f"\r下载 {file_name}: {downloaded/1024/1024:.2f}/{total/1024/1024:.2f} MB ({downloaded*100//total}%)", end="", flush=True)
-                    else:
-                        print(f"\r下载 {file_name}: {downloaded/1024/1024:.2f} MB", end="", flush=True)
-            print()  # 换行
+    try:
+        print(f"开始下载文件到{DOWNLOAD_DIR}：{file_name}，URL: {url}")
+        file_path = os.path.join(DOWNLOAD_DIR, file_name)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30, read=120, write=30, pool=30), follow_redirects=True) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                with open(file_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            print(f"\r下载 {file_name}: {downloaded/1024/1024:.2f}/{total/1024/1024:.2f} MB ({downloaded*100//total}%)", end="", flush=True)
+                        else:
+                            print(f"\r下载 {file_name}: {downloaded/1024/1024:.2f} MB", end="", flush=True)
+                print()  # 换行
+    except Exception as e:
+        print(f"下载文件失败：{e}")
+        raise
+    print(f"下载完成 {file_path}")
     return file_path
 
 
 
 async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, file_name: str, file_size: int):
     """后台执行文件转移：直接 HTTP 下载 -> 上传到有空间的群盘"""
+    file_path = ""
+    file_name = file_name.replace(":", "_").replace("*", "_").replace("?", "_").replace('"', "_").replace("<", "_").replace(">", "_").replace("|", "_").replace(" ", "_")  # 替换文件名中的斜杠，避免路径问题
     try:
-        file_url = (await bot.get_group_file_url(file_id=file_id, group_id=group_id))["url"] # type: ignore
+        files = await get_qpan_files(bot) # type: ignore # 刷新文件列表，确保 file_id 对应的文件信息已更新到 file_messages 中
+        target_group_id = next((f["group_id"] for f in files if f["file_id"] == file_id), group_id) # type: ignore # 获取文件所属的群ID，优先使用最新的文件列表信息
+        file_url = (await bot.get_group_file_url(file_id=file_id, group_id=target_group_id))["url"] # type: ignore
+        if not file_url:
+            await bot.send_group_msg(group_id=group_id, message=f"未找到 file_id={file_id} 的下载链接，无法转移") # type: ignore
+            return
+        print("111111111111111111111111111")
         file_path = await download_file_by_url(file_url, file_name)
-
+        print("222222222222222222222222222222")
         free_group_id = await get_qpan_group_with_enough_space(bot, file_size) # type: ignore
+        print("23333333333333333333333333")
         if free_group_id:
+            #[CQ:file,file=stopRunDeathReboot.txt,url=,file_id=/ac730bb9-08a3-4e7b-b9f1-e9e23e450d60,path=,file_size=3]
             # await bot.upload_group_file(group_id=free_group_id, file=file_path, name=file_name) # type: ignore
-            await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file_id={file_id},file={file_name},url=,path={file_path}]")
+            file_path = file_path.replace("\\" , "/") # Windows路径转换为URL路径
+            await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file_id={file_id},file={file_name},path={file_path},file_size={file_size}]")
+
             await bot.send_group_msg(group_id=group_id, message=f"文件 {file_name} 已成功转移到群 {free_group_id}！") # type: ignore
             # if message_id :
             #     # 记录转移后的消息ID和时间戳，后续用于自动刷新
@@ -185,6 +202,8 @@ async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, f
             #         "group_id": free_group_id,
             #         "file_name": file_name,
             #     }
+
+
             #     _save_file_messages()
         else:
             await bot.send_group_msg(group_id=group_id, message=f"警告：未找到剩余空间足够的群盘来存储文件 {file_name}，请管理员尽快清理空间！") # type: ignore
@@ -194,7 +213,7 @@ async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, f
     except Exception as e:
         print(f"文件转移失败：{e}")
         try:
-            await bot.send_group_msg(group_id=group_id, message=f"文件 {file_name} 转移失败：{e}") # type: ignore
+            await bot.send_group_msg(group_id=group_id, message=f"文件 {file_name} From 路径 {file_path} 转移失败：{e}") # type: ignore
         except Exception:
             pass
 
@@ -202,7 +221,10 @@ async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, f
 file_upload = on_notice()
 
 @file_upload.handle()
-async def handle_group_upload(bot: Bot, event: Event ):
+async def handle_group_upload(bot: Bot, event: Event ):  # noqa: C901
+    if event.get_user_id() == str(bot.self_id):
+        return  # 忽略自己上传的文件事件，避免死循环
+
     event_type = event.notice_type # type: ignore
     print(f"收到事件：{event_type}") # 打印事件类型以调试
     if event_type == "group_upload": # 监听群文件上传事件
@@ -213,6 +235,19 @@ async def handle_group_upload(bot: Bot, event: Event ):
 
         current_qpan_info = await get_qpan_file_info(bot, group_id) # type: ignore # 获取当前群盘信息以计算剩余空间
         await file_upload.send(f"检测到群 {group_id} 中用户 {user_id} 上传了文件 {file_name}，大小为 {file_size} 字节，file_id: {event.file.id}，当前群盘使用率：{int(current_qpan_info.used_space/current_qpan_info.total_space * 100)}% ，是否足够？ {current_qpan_info.total_space - current_qpan_info.used_space >= file_size}") # type: ignore # 发送通知消息
+
+        if file_id := event.file.id: # type: ignore # 获取上传文件的 file_id
+            if file_id not in file_messages: # type: ignore
+                await file_upload.send(f"file_id={file_id} 的记录尚未更新到 file_messages 中，可能尚未捕获到消息事件，稍后将自动刷新")
+            else:
+                await file_upload.send(f"file_id={file_id} 的记录已存在于 file_messages 中，message_id={file_messages[file_id]['message_id']}") # type: ignore
+
+        files = await get_qpan_files(bot) # type: ignore # 刷新文件列表，确保 file_messages 中有最新的记录
+        for file in files:
+            if file["file_name"] == file_name and file["file_size"] == file_size: # type: ignore
+                await file_upload.finish(f"文件 {file_name} 已存在于群盘中") # type: ignore
+                return  # 如果文件已存在于群盘中，直接返回，不进行后续处理
+
         # 等待 handle_message 捕获用户发送的原始文件消息（notice 与 message 事件几乎同时到达，稍等即可）
         await asyncio.sleep(1)
         current_qpan_info = await get_qpan_file_info(bot, group_id) # type: ignore #刷新群盘信息，获取最新的剩余空间情况
@@ -446,9 +481,9 @@ async def _start_refresh_task() -> None:
 file_messages: dict[str, dict] = _load_file_messages()  # file_id -> {message_id, timestamp, group_id}
 
 
-def _record_file_message(raw_message: str) -> None:
+def _record_file_message(raw_message: str , message_id: int , group_id: int) -> None:
     """从消息事件中提取文件 CQ 码并记录映射关系。"""
-    print(f"收到消息：{raw_message}") # 打印收到的消息内容以调试
+    # print(f"收到消息：{raw_message}") # 打印收到的消息内容以调试
 
     #sample [CQ:file,file=vfcompat.dll,url=,file_id=/c56bcc83-678b-4454-8bab-c6eb99b0dc6d,path=,file_size=68104]
     if "[CQ:file," in raw_message:
@@ -463,9 +498,9 @@ def _record_file_message(raw_message: str) -> None:
                 oldest_key = next(iter(file_messages))
                 del file_messages[oldest_key]
             file_messages[file_id] = {
-                "message_id": getattr(event, "message_id", 0),
+                "message_id": message_id,
                 "timestamp": time.time(),
-                "group_id": getattr(event, "group_id", 0),
+                "group_id": group_id,
                 "file_name": file_name,
             }
             _save_file_messages()
@@ -477,8 +512,8 @@ def _record_file_message(raw_message: str) -> None:
 async def handle_message(bot: Bot, event: Event):
     user_id = getattr(event, "user_id", None)
     is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
-    print(f"message 事件触发 (self={is_self_message})")
-    _record_file_message(event.raw_message) # type: ignore
+    # print(f"message 事件触发 (self={is_self_message})")
+    _record_file_message(event.raw_message, event.message_id, event.group_id) # type: ignore
 
 
 @self_msg.handle()
@@ -487,6 +522,6 @@ async def handle_self_message(bot: Bot, event: Event):
         return
     user_id = getattr(event, "user_id", None)
     is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
-    print(f"message_sent 事件触发 (self={is_self_message})")
-    _record_file_message(event.raw_message) # type: ignore
+    # print(f"message_sent 事件触发 (self={is_self_message})")
+    _record_file_message(event.raw_message, event.message_id, event.group_id) # type: ignore
 

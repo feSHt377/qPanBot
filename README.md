@@ -18,7 +18,7 @@
 - `nonebot2[fastapi,websockets] >= 2.4.4`
 - `nonebot-adapter-onebot >= 2.4.6`
 - OneBot V11 实现端（目前已知 LLONEBOT 支持文件转永久操作，其他未知）注意！需要开启上报机器人消息！！
-- 测试端建议使用 LuckyLilliaBot：`https://github.com/LLOneBot/LuckyLilliaBot`
+- 测试端建议使用 [LuckyLilliaBot](https://github.com/LLOneBot/LuckyLilliaBot)
 
 
 ## 🚀 快速启动
