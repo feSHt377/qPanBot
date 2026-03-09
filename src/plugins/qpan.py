@@ -4,10 +4,27 @@ import os
 from types import SimpleNamespace
 
 import httpx
-from nonebot import on_command, on_notice
+from nonebot import on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import Bot, Event, Message
 from nonebot.params import CommandArg
 from nonebot.typing import T_State
+from pypinyin import Style, lazy_pinyin
+
+
+def convert_chinese_to_pinyin(filename: str) -> str:
+    """将中文文件名转换为拼音，保留扩展名和非中文字符"""
+    # 分离文件名和扩展名
+    if "." in filename:
+        name_parts = filename.rsplit(".", 1)
+        name = name_parts[0]
+        ext = "." + name_parts[1]
+    else:
+        name = filename
+        ext = ""
+
+    # 转换为拼音（无音调，小写）
+    pinyin_name = "".join(lazy_pinyin(name, style=Style.NORMAL))
+    return pinyin_name + ext
 
 
 async def get_qpan_groups(bot: Bot):
@@ -59,7 +76,7 @@ async def get_qpan_group_with_enough_space(bot: Bot, file_size: int):
             return group["group_id"] # type: ignore 返回第一个满足条件的群ID
     return None # 如果没有找到满足条件的群盘，返回None
 
-async def set_qpan_file_forever(bot: Bot, file_id: str, group_id: int, max_retries: int = 3):
+async def set_qpan_file_forever(bot: Bot, file_id: str, file_name: str, group_id: int, max_retries: int = 3):
     # 设置文件永久保存，带重试机制
     for attempt in range(max_retries):
         try:
@@ -69,12 +86,12 @@ async def set_qpan_file_forever(bot: Bot, file_id: str, group_id: int, max_retri
         except Exception as e:
             print(f"设置永久保存失败（第{attempt + 1}次）：{e}")
             if attempt == max_retries - 1:
-                return False  # 所有重试都失败
-
+                break #不退出函数，只记录错误日志，继续后续操作
+    await asyncio.sleep(2)  # 等待一段时间让设置生效
 
     qpan_files = await get_qpan_files(bot) # type: ignore
     for file in qpan_files:
-        if file["file_id"] == file_id and file["group_id"] == group_id: # type: ignore
+        if file["file_name"] == file_name : # type: ignore # 找到对应的文件信息
             file["dead_time"] = 0 # type: ignore # 更新文件的过期时间为0，表示永久保存
             return True
 
@@ -107,6 +124,7 @@ async def download_file_by_url(url: str, file_name: str) -> str:
     return file_path
 
 
+#弃用
 async def transfer_file_to_free_group(bot: Bot, event: Event, group_id: int, file_name: str, file_size: int):
     """后台执行文件转移：直接 HTTP 下载 -> 上传到有空间的群盘"""
     try:
@@ -141,19 +159,40 @@ async def handle_group_upload(bot: Bot, event: Event):
         user_id = event.user_id # type: ignore
         file_name = event.file.name # type: ignore
         file_size = event.file.size # type: ignore
+        # 将中文文件名转换为拼音
+        pinyin_filename = convert_chinese_to_pinyin(file_name)
+        if pinyin_filename != file_name:
+            await file_upload.finish("不支持中文文件名，请将文件名转换为英文或拼音后重新上传！") # type: ignore # 发送错误消息并结束处理
+
+        # await file_upload.send(f"[CQ:file,file={file_name},url=,file_id={event.file.id},path=,file_size={file_size}]") # type: ignore # 发送初始通知消息
+        await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file={file_name},url=,file_id={event.file.id},path=,file_size={file_size}]") # type: ignore # 发送初始通知消息
 
         current_qpan_info = await get_qpan_file_info(bot, group_id) # type: ignore # 获取当前群盘信息以计算剩余空间
-        await file_upload.send(f"检测到群 {group_id} 中用户 {user_id} 上传了文件 {file_name}，大小为 {file_size} 字节，当前群盘使用率：{int(current_qpan_info.used_space/current_qpan_info.total_space * 100)}% , 是否足够？ {current_qpan_info.total_space - current_qpan_info.used_space >= file_size}") # type: ignore # 发送通知消息
-        # await bot.forward_group_single_msg(group_id=group_id, message_id = event.message_id) # type: ignore # 尝试将文件转移到另一个用户的空间中，替换为实际的目标用户ID
-        asyncio.create_task(transfer_file_to_free_group(bot, event, group_id, file_name, file_size))
+        await file_upload.send(f"检测到群 {group_id} 中用户 {user_id} 上传了文件 {file_name}，大小为 {file_size} 字节，file_id: {event.file.id}，当前群盘使用率：{int(current_qpan_info.used_space/current_qpan_info.total_space * 100)}% ，是否足够？ {current_qpan_info.total_space - current_qpan_info.used_space >= file_size}") # type: ignore # 发送通知消息
 
-        if current_qpan_info.total_space - current_qpan_info.used_space < file_size: # 如果剩余空间不足以存储新文件
-            await file_upload.send(f"警告：群 {group_id} 中用户 {user_id} 上传的文件 {file_name} 大小为 {file_size} 字节，超过了当前群盘剩余空间！正在后台转移文件...") # type: ignore
-            # 后台执行文件转移，避免下载大文件导致 WebSocket 超时
-            asyncio.create_task(transfer_file_to_free_group(bot, event, group_id, file_name, file_size))
+
+        if current_qpan_info.total_space - current_qpan_info.used_space < file_size or file_name == "test.txt": # 如果剩余空间不足以存储新文件
+            if file_name == "test.txt":
+                file_size = 1024 * 1024 * 1024 * 5 # 模拟一个5GB的文件大小用于测试转移功能
+                await file_upload.send(f"检测到测试文件 {file_name}，模拟文件大小为 {file_size} 字节，用于测试转移功能！") # type: ignore 发送测试文件消息
+
+            await file_upload.send(f"警告：群 {group_id} 中用户 {user_id} 上传的文件 {file_name} 大小为 {file_size} 字节，超过了当前群盘剩余空间！正在查找空闲群盘...") # type: ignore 发送警告消息
+            free_group_id = await get_qpan_group_with_enough_space(bot, file_size) # type: ignore # 查找一个剩余空间足够的群盘
+            if free_group_id:
+                await file_upload.send(f"找到空闲群盘 {free_group_id}，正在转移文件 {file_name}...") # type: ignore 发送找到空闲群盘的消息
+                await bot.send_group_msg(group_id=free_group_id, message=f"[CQ:file,file={file_name},url=,file_id={event.file.id},path=,file_size={file_size}]") # type: ignore # 发送初始通知消息
+                await file_upload.send(f"已上传{file_name}至{free_group_id},正在转为永久文件") # type: ignore 发送转移中的消息
+
+                if await set_qpan_file_forever(bot, event.file.id , file_name, free_group_id) :# type: ignore # 尝试设置新上传的文件为永久保存
+                    await file_upload.send(f"已自动设置文件 {file_name} 为永久保存！") # type: ignore # 发送成功消息
+                else:
+                    await file_upload.send(f"自动设置文件 {file_name} 为永久保存失败，可能是因为未找到对应文件信息！") # type: ignore # 发送失败消息
+
+
+
 
         else:
-            if await set_qpan_file_forever(bot, event.file.id, group_id) : # type: ignore # 尝试设置新上传的文件为永久保存
+            if await set_qpan_file_forever(bot, event.file.id , file_name, group_id) : # type: ignore # 尝试设置新上传的文件为永久保存
                 await file_upload.send(f"已自动设置文件 {file_name} 为永久保存！") # type: ignore # 发送成功消息
             else:
                 await file_upload.send(f"自动设置文件 {file_name} 为永久保存失败，可能是因为未找到对应文件信息！") # type: ignore # 发送失败消息
@@ -196,7 +235,7 @@ async def cmd_list(bot, event, sub_args):
     paginated_files = file_list[start_index:end_index]
 
     filter_desc = "全部" if filter_permanent is None else ("永久" if filter_permanent else "非永久")
-    file_info_list = "\n".join(f"{file['file_name']} \n(大小: {file['file_size']/1024/1024:.2f} MB ，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0})" for file in paginated_files)
+    file_info_list = "\n".join(f"{file['file_name']} \n(大小: {file['file_size']/1024/1024:.2f} MB ，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , file_id: {file['file_id']})" for file in paginated_files)
 
     await qpan.finish(f"文件列表（{filter_desc}）：\n{file_info_list}\n共 {len(file_list)} 个文件 \n 第 {page} / {all_page} 页")
 
@@ -206,7 +245,7 @@ async def cmd_search(bot, event, sub_args):
 
     matching_files = [f for f in file_list if keyword in f["file_name"]]
 
-    await qpan.finish(f"搜索：{keyword}，找到 {len(matching_files)} 个文件：\n" + "\n".join(f"{file['file_name']} (大小: {file['file_size']/1024/1024:.2f} MB，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0})" for file in matching_files))
+    await qpan.finish(f"搜索：{keyword}，找到 {len(matching_files)} 个文件：\n" + "\n".join(f"{file['file_name']} (大小: {file['file_size']/1024/1024:.2f} MB，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , file_id: {file['file_id']})" for file in matching_files))
 
 async def cmd_info(bot, event, sub_args):
     qpan_info = await get_qpan_file_info(bot) # type: ignore
@@ -239,4 +278,18 @@ async def handle_qpan(bot: Bot, event: Event, state: T_State, args: Message = Co
         await qpan.finish("请输入子命令，发送 qpan help 查看帮助")
     else:
         await qpan.finish(f"未知子命令：{sub}")
+
+
+msg = on_message(priority=10)
+
+# file_messages = []
+
+@msg.handle()
+async def handle_message(bot: Bot, event: Event):
+    # if event.get_message()
+    print(f"收到消息：{event.get_message()}") # 打印收到的消息内容以调试
+
+    # if "file" in event.raw_message: # type: ignore
+
+    #     await bot.forward_group_single_msg(group_id=event.group_id, message_id=event.message_id) # type: ignore # 尝试将消息转发到另一个群，替换为实际的目标群ID
 
