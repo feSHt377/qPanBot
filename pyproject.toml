@@ -34,7 +34,6 @@ nonebot-adapter-onebot = [
 
 [tool.nonebot.plugins]
 "@local" = []
-nonebot-plugin-status = ["nonebot_plugin_status"]
 [tool.ruff]
 line-length = 88
 target-version = "py310"
