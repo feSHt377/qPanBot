@@ -77,12 +77,17 @@ async def get_qpan_group_with_enough_space(bot: Bot, file_size: int):
             return group["group_id"] # type: ignore 返回第一个满足条件的群ID
     return None # 如果没有找到满足条件的群盘，返回None
 
-async def set_qpan_file_forever(bot: Bot, file_id: str, file_name: str, group_id: int, max_retries: int = 3):
+# 由于傻逼qq群文件换地方会导致file_id变化，所以设置永久保存时不能用file_id作为参数，而是只能通过文件名和大小来设置，因此这个函数会有一定的误判风险，如果同名同大小的文件存在的话可能会设置错误的文件为永久保存，后续可以考虑增加一些其他的判断条件来提高准确性，例如文件的上传时间等
+async def set_qpan_file_forever(bot: Bot, file_size : int, file_name: str, group_id: int, max_retries: int = 3):
     # 设置文件永久保存，带重试机制
     for attempt in range(max_retries):
         try:
-            await asyncio.sleep(2 * (attempt + 1))  # 延迟 2/4/6 秒后再调用
-            await bot.set_group_file_forever(file_id=file_id, group_id=group_id) # type: ignore
+            await asyncio.sleep(0.35)  # 延迟 0.35 秒后再调用
+            files = await get_qpan_files(bot) # type: ignore 获取当前群盘文件列表
+            target_file = next((f for f in files if f["file_name"] == file_name and f["file_size"] == file_size and f["group_id"] == group_id), None) # type: ignore # 找到对应的文件信息
+            if target_file is None:
+                raise ValueError(f"未在群 {group_id} 中找到文件 {file_name}（大小 {file_size}），可能尚未同步")  # noqa: TRY003
+            await bot.set_group_file_forever(file_id=target_file["file_id"], group_id=group_id) # type: ignore
             break  # 成功则跳出重试循环
         except Exception as e:
             print(f"设置永久保存失败（第{attempt + 1}次）：{e}")
@@ -92,8 +97,7 @@ async def set_qpan_file_forever(bot: Bot, file_id: str, file_name: str, group_id
 
     qpan_files = await get_qpan_files(bot) # type: ignore
     for file in qpan_files:
-        if file["file_name"] == file_name : # type: ignore # 找到对应的文件信息
-            file["dead_time"] = 0 # type: ignore # 更新文件的过期时间为0，表示永久保存
+        if file["file_name"] == file_name and file["file_size"] == file_size and file["group_id"] == group_id and file["dead_time"] == 0: # type: ignore # 找到对应的文件信息# 更新文件的过期时间为0，表示永久保存
             return True
 
     return False # 如果没有找到对应的文件，返回False表示设置失败
@@ -202,7 +206,7 @@ async def handle_group_upload(bot: Bot, event: Event):
 
                 await file_upload.send(f"已上传{file_name}至{free_group_id},正在转为永久文件") # type: ignore 发送转移中的消息
 
-                if await set_qpan_file_forever(bot, event.file.id , file_name, free_group_id) :# type: ignore # 尝试设置新上传的文件为永久保存
+                if await set_qpan_file_forever(bot, file_size=file_size, file_name=file_name, group_id=free_group_id) :# type: ignore # 尝试设置新上传的文件为永久保存
                     await file_upload.send(f"已自动设置文件 {file_name} 为永久保存！") # type: ignore # 发送成功消息
                 else:
                     await file_upload.send(f"自动设置文件 {file_name} 为永久保存失败，可能是因为未找到对应文件信息！") # type: ignore # 发送失败消息
@@ -211,7 +215,7 @@ async def handle_group_upload(bot: Bot, event: Event):
 
 
         else:
-            if await set_qpan_file_forever(bot, event.file.id , file_name, group_id) : # type: ignore # 尝试设置新上传的文件为永久保存
+            if await set_qpan_file_forever(bot, file_size=file_size, file_name=file_name, group_id=group_id) : # type: ignore # 尝试设置新上传的文件为永久保存
                 await file_upload.send(f"已自动设置文件 {file_name} 为永久保存！") # type: ignore # 发送成功消息
             else:
                 await file_upload.send(f"自动设置文件 {file_name} 为永久保存失败，可能是因为未找到对应文件信息！") # type: ignore # 发送失败消息
