@@ -481,9 +481,17 @@ async def cmd_get(bot, event, sub_args):
             else:
                 # message_id 存在，直接转发
                 await qpan.send(f"正在发送文件 {target_file['file_name']} 到当前群！(uid: {uid})") # type: ignore
-                await send_file_to_group(bot, event.group_id, target_file["file_id"]) # type: ignore
+                ok = await send_file_to_group(bot, event.group_id, target_file["file_id"]) # type: ignore
+                if not ok:
+                    if record in file_messages:
+                        file_messages.remove(record)
+                        _save_file_messages()
+                    await qpan.finish("uid 对应记录已失效并已自动删除，请重试或使用 file_id 获取")
         else:
-            await qpan.finish("未找到指定文件，可能已被删除或 file_id 尚未同步")
+            if record in file_messages:
+                file_messages.remove(record)
+                _save_file_messages()
+            await qpan.finish("未找到指定文件，已自动删除失效 uid 记录")
 
 
 async def cmd_remove(bot, event, sub_args):
@@ -792,6 +800,58 @@ def _save_file_messages() -> None:
     with open(FILE_MESSAGES_PATH, "w", encoding="utf-8") as f:
         json.dump(file_messages, f, ensure_ascii=False, indent=2)
 
+
+def _merge_file_messages() -> None:
+    """按文件特征合并重复记录，优先保留有 message_id 的有效记录。"""
+    if not file_messages:
+        return
+
+    merged_map: dict[tuple[int, str, int], dict[str, object]] = {}
+    for raw in file_messages:
+        record = dict(raw)
+        key = (
+            _as_int(record.get("group_id", 0)),
+            str(record.get("file_name", "")),
+            _as_int(record.get("file_size", 0)),
+        )
+
+        existing = merged_map.get(key)
+        if existing is None:
+            merged_map[key] = record
+            continue
+
+        existing_score = (
+            _as_int(existing.get("message_id", 0)) > 0,
+            _as_float(existing.get("timestamp", 0.0)),
+        )
+        current_score = (
+            _as_int(record.get("message_id", 0)) > 0,
+            _as_float(record.get("timestamp", 0.0)),
+        )
+
+        winner = record if current_score > existing_score else existing
+        loser = existing if winner is record else record
+
+        winner_uid = str(winner.get("uid", "")).strip()
+        loser_uid = str(loser.get("uid", "")).strip()
+        winner["uid"] = winner_uid if winner_uid and winner_uid != "0" else (
+            loser_uid if loser_uid and loser_uid != "0" else shortuuid.uuid()
+        )
+        merged_map[key] = winner
+
+    merged = list(merged_map.values())
+    for item in merged:
+        uid = str(item.get("uid", "")).strip()
+        if not uid or uid == "0":
+            item["uid"] = shortuuid.uuid()
+
+    before = len(file_messages)
+    after = len(merged)
+    file_messages[:] = merged
+    if before != after:
+        print(f"文件记录合并完成：{before} -> {after}")
+    _save_file_messages()
+
 async def _do_refresh_file_messages() -> None:
     """将超过 REFRESH_AFTER_DAYS 天的记录重新转发到原群，handle_message 会自动更新 timestamp"""
     try:
@@ -901,6 +961,7 @@ async def _resend_all_file_norecord(bot : Bot) -> None:
                     _as_int(file.get("file_size", 0))
                 )
 
+
                 # 复用旧 uid 或生成新 uid
                 uid = str(existing_by_sig.get("uid")) if existing_by_sig is not None else shortuuid.uuid()
 
@@ -961,6 +1022,9 @@ driver = get_driver()
 @driver.on_startup
 async def _start_refresh_task() -> None:
     """机器人启动时执行初始化任务"""
+    # 合并重复记录，避免历史无效数据污染
+    _merge_file_messages()
+
     # 清理下载目录残余文件
     _cleanup_download_dir()
 
@@ -971,7 +1035,7 @@ async def _start_refresh_task() -> None:
 file_messages: list[dict[str, object]] = _load_file_messages()  # uid -> file metadata
 
 
-def _record_file_message(raw_message: str , message_id: int , group_id: int) -> None:
+async def _record_file_message(bot : Bot ,raw_message: str , message_id: int , group_id: int) -> None:
     """从消息事件中提取文件 CQ 码并记录映射关系。"""
     # print(f"收到消息：{raw_message}") # 打印收到的消息内容以调试
 
@@ -985,10 +1049,18 @@ def _record_file_message(raw_message: str , message_id: int , group_id: int) -> 
             file_name = file_name_match.group(1) if file_name_match else ""
             file_size_match = re.search(r"file_size=(\d+)", raw_message)
             file_size = int(file_size_match.group(1)) if file_size_match else 0
+
+            files = await get_qpan_files(bot)  # type: ignore
+            file = next((f for f in files if f["file_id"] == file_id), None)  # type: ignore
+            if file["dead_time"] != 0: # type: ignore
+                print(f"文件 {file_name}（file_id: {file_id}） 已过期，无法记录")
+            await set_qpan_file_forever(bot , file["file_size"] , file_name=file["file_name"] , group_id=group_id ) # type: ignore
             _upsert_file_message(file_id, message_id, group_id, file_name, file_size)
             _save_file_messages()
             # await msg.send(f"已记录文件消息，file_id: {file_id}，message_id: {event.message_id}") # type: ignore
         # await bot.forward_group_single_msg(group_id=event.group_id, message_id=event.message_id) # type: ignore # 尝试将消息转发到另一个群，替换为实际的目标群ID
+
+
 
 
 @msg.handle()
@@ -996,7 +1068,7 @@ async def handle_message(bot: Bot, event: Event):
     # user_id = getattr(event, "user_id", None)
     # is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
     # print(f"message 事件触发 (self={is_self_message})")
-    _record_file_message(event.raw_message, event.message_id, event.group_id) # type: ignore
+    await _record_file_message(bot, event.raw_message, event.message_id, event.group_id) # type: ignore
 
 
 @self_msg.handle()
@@ -1006,5 +1078,5 @@ async def handle_self_message(bot: Bot, event: Event):
     # user_id = getattr(event, "user_id", None)
     # is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
     # print(f"message_sent 事件触发 (self={is_self_message})")
-    _record_file_message(event.raw_message, event.message_id, event.group_id) # type: ignore
+    await _record_file_message(bot, event.raw_message, event.message_id, event.group_id) # type: ignore
 
