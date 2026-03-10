@@ -634,6 +634,8 @@ async def cmd_remove(bot, event, sub_args):
         else:
             await qpan.finish(f"未知的删除类型：{sub_cmd}，请使用 nonpermanent 或 repeated")
 
+
+
 SUB_COMMANDS = {
     "help": cmd_help, "帮助": cmd_help,
     "list": cmd_list, "列表": cmd_list,
