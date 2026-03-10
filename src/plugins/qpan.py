@@ -463,10 +463,28 @@ async def cmd_get(bot, event, sub_args):
                 _save_file_messages()
 
         if target_file:
-            await qpan.send(f"正在发送文件 {target_file['file_name']} 到当前群！(uid: {uid})") # type: ignore
-            await send_file_to_group(bot, event.group_id, target_file["file_id"]) # type: ignore
+            # 检查是否缺少 message_id，如果缺失则需要重新上传
+            message_id = _as_int(record.get("message_id", 0))
+            if message_id == 0:
+                # message_id 缺失，启动后台重新上传任务
+                await qpan.send(f"文件 {target_file['file_name']} 的消息记录缺失，正在重新上传以获取消息 ID...") # type: ignore
+                asyncio.create_task(
+                    transfer_file_to_free_group(
+                        bot,
+                        target_file["file_id"],
+                        _as_int(record.get("group_id", 0)),
+                        target_file["file_name"],
+                        _as_int(target_file.get("file_size", 0))
+                    )
+                )
+                await qpan.finish("已启动后台重新上传任务，请稍候...")
+            else:
+                # message_id 存在，直接转发
+                await qpan.send(f"正在发送文件 {target_file['file_name']} 到当前群！(uid: {uid})") # type: ignore
+                await send_file_to_group(bot, event.group_id, target_file["file_id"]) # type: ignore
         else:
             await qpan.finish("未找到指定文件，可能已被删除或 file_id 尚未同步")
+
 
 async def cmd_remove(bot, event, sub_args):
     """删除文件，支持按uid、按file_id或删除所有特定类型文件"""
@@ -814,9 +832,47 @@ async def _refresh_loop() -> None:
         # else:
         #     print(f"距离下次刷新还有 {(REFRESH_INTERVAL_HOURS * 3600 - (time.time() - last_refresh)) / 60:.2f} 分钟")
 
-# 遍历群盘文件，并与本地记录对比，找出未被记录的或uid丢失的文件，补充记录到 file_messages 中
+def _cleanup_download_dir() -> None:
+    """启动时清理下载目录中的残余文件"""
+    try:
+        if not os.path.exists(DOWNLOAD_DIR):
+            print(f"下载目录不存在：{DOWNLOAD_DIR}")
+            return
+
+        files = os.listdir(DOWNLOAD_DIR)
+        if not files:
+            print("下载目录已清空")
+            return
+
+        deleted_count = 0
+        for file_name in files:
+            file_path = os.path.join(DOWNLOAD_DIR, file_name)
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+                    deleted_count += 1
+                    print(f"删除残余文件：{file_name}")
+                elif os.path.isdir(file_path):
+                    import shutil
+                    shutil.rmtree(file_path)
+                    deleted_count += 1
+                    print(f"删除残余目录：{file_name}")
+            except Exception as e:
+                print(f"删除 {file_name} 失败：{e}")
+
+        if deleted_count > 0:
+            print(f"下载目录自检完成，删除了 {deleted_count} 个残余文件/目录")
+    except Exception as e:
+        print(f"下载目录自检失败：{e}")
+
+# 遍历群盘文件，为缺失 uid 的文件补充 uid，缺失 message_id 的文件将由消息捕获自动更新
 async def _resend_all_file_norecord(bot : Bot) -> None:
-    """遍历群盘文件，找出未记录或uid丢失的文件，补充记录"""
+    """遍历群盘文件，为缺失 uid 的文件补充 uid
+    
+    说明：
+    - 只负责补充 uid，使用文件特征（group_id, file_name, file_size）匹配复用现有 uid
+    - 缺失 message_id 的文件需要通过重新下载上传，由 msg 事件自动捕获并更新
+    """
     try:
         files = await get_qpan_files(bot)  # type: ignore
         if not files:
@@ -824,6 +880,8 @@ async def _resend_all_file_norecord(bot : Bot) -> None:
             return
 
         updated_count = 0
+        needs_reupload = []  # 记录需要重新上传的文件（缺少 message_id）
+        
         for file in files:
             file_id = file.get("file_id", "")
             if not file_id:
@@ -832,22 +890,22 @@ async def _resend_all_file_norecord(bot : Bot) -> None:
             # 查找是否已有记录
             record = _find_file_message(file_id)
 
-            # 如果没有记录，或者 uid 丢失，则需补充/更新
+            # 如果没有记录，或者 uid 丢失，则需补充 uid
             if record is None or not str(record.get("uid", "")).strip():
-                # 按文件特征匹配现有 uid（文件移动的情况）
+                # 按文件特征匹配现有 uid（文件可能已移动但同名同大小）
                 existing_by_sig = _find_file_message_by_signature(
                     _as_int(file.get("group_id", 0)),
                     file.get("file_name", ""),
                     _as_int(file.get("file_size", 0))
                 )
 
-                # 由用旧 uid 或生成新 uid
+                # 复用旧 uid 或生成新 uid
                 uid = str(existing_by_sig.get("uid")) if existing_by_sig is not None else shortuuid.uuid()
 
-                # 構建新记录
+                # 构建新记录（message_id 可为 0，后续由消息事件自动更新）
                 payload = {
                     "file_id": file_id,
-                    "message_id": _as_int(record.get("message_id", 0)) if record else 0,  # 保留旧消息 ID（如果不有则设为 0）
+                    "message_id": _as_int(record.get("message_id", 0)) if record else 0,
                     "timestamp": time.time(),
                     "group_id": _as_int(file.get("group_id", 0)),
                     "uid": uid,
@@ -864,10 +922,34 @@ async def _resend_all_file_norecord(bot : Bot) -> None:
 
                 updated_count += 1
 
+                # 如果缺少 message_id，标记为需要重新上传
+                if payload["message_id"] == 0:
+                    needs_reupload.append({
+                        "file_id": file_id,
+                        "group_id": payload["group_id"],
+                        "file_name": payload["file_name"],
+                        "file_size": payload["file_size"]
+                    })
+
         if updated_count > 0:
             _save_file_messages()
-            print(f"补充文件记录完成，更新了 {updated_count} 条记录，共 {len(file_messages)} 条")
-        else:
+            print(f"补充文件 uid 完成，更新了 {updated_count} 条记录，共 {len(file_messages)} 条")
+        
+        # 如果有文件需要重新上传以捕获 message_id，后台启动上传任务
+        if needs_reupload:
+            print(f"检测到 {len(needs_reupload)} 个文件缺少 message_id，需要重新下载上传")
+            for file_info in needs_reupload:
+                asyncio.create_task(
+                    transfer_file_to_free_group(
+                        bot,
+                        file_info["file_id"],
+                        file_info["group_id"],
+                        file_info["file_name"],
+                        file_info["file_size"]
+                    )
+                )
+        
+        if updated_count == 0 and not needs_reupload:
             print("所有群盘文件都已有有效记录")
     except Exception as e:
         print(f"补充文件记录失败：{e}")
@@ -876,6 +958,11 @@ driver = get_driver()
 
 @driver.on_startup
 async def _start_refresh_task() -> None:
+    """机器人启动时执行初始化任务"""
+    # 清理下载目录残余文件
+    _cleanup_download_dir()
+
+    # 启动后台刷新循环
     # asyncio.create_task(_resend_all_file_norecord())
     asyncio.create_task(_refresh_loop())
 
