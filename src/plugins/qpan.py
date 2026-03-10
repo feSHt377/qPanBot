@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 import httpx
+import shortuuid
 from nonebot import get_driver, on, on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import Bot, Event, Message
 from nonebot.params import CommandArg
@@ -110,7 +111,7 @@ async def set_qpan_file_forever(bot: Bot, file_size : int, file_name: str, group
 
 async def send_file_to_group(bot: Bot, group_id: int, file_id: str) -> bool:
     """通过转发原始消息将文件发送到目标群，不触发下载"""
-    info = file_messages.get(file_id)  # type: ignore
+    info = _find_file_message(file_id)
     if info is None:
         print(f"未找到 file_id={file_id} 的原始消息记录，无法转发（仅支持通过聊天框发送的文件，文件面板上传不产生消息事件）")
 
@@ -174,7 +175,7 @@ async def download_file_by_url(url: str, file_name: str) -> str:
 async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, file_name: str, file_size: int):
     """后台执行文件转移：直接 HTTP 下载 -> 上传到有空间的群盘"""
     file_path = ""
-    file_name = file_name.replace(":", "_").replace("*", "_").replace("?", "_").replace('"', "_").replace("<", "_").replace(">", "_").replace("|", "_").replace(" ", "_")  # 替换文件名中的斜杠，避免路径问题
+    #file_name = file_name.replace(":", "_").replace("*", "_").replace("?", "_").replace('"', "_").replace("<", "_").replace(">", "_").replace("|", "_").replace(" ", "_")  # 替换文件名中的斜杠，避免路径问题
     try:
         files = await get_qpan_files(bot) # type: ignore # 刷新文件列表，确保 file_id 对应的文件信息已更新到 file_messages 中
         target_group_id = next((f["group_id"] for f in files if f["file_id"] == file_id), group_id) # type: ignore # 获取文件所属的群ID，优先使用最新的文件列表信息
@@ -190,9 +191,9 @@ async def transfer_file_to_free_group(bot: Bot, file_id : str , group_id: int, f
         if free_group_id:
             #[CQ:file,file=stopRunDeathReboot.txt,url=,file_id=/ac730bb9-08a3-4e7b-b9f1-e9e23e450d60,path=,file_size=3]
             # await bot.upload_group_file(group_id=free_group_id, file=file_path, name=file_name) # type: ignore
-            file_path = file_path.replace("\\" , "/") # Windows路径转换为URL路径
-            await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file_id={file_id},file={file_name},path={file_path},file_size={file_size}]")
-
+            #file_path = file_path.replace("\\" , "/") # Windows路径转换为URL路径
+            #await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file_id={file_id},file={file_name},path={file_path},file_size={file_size}]")
+            await bot.send_group_msg(group_id=group_id, message=f"[CQ:file,file_id={file_id},file={file_path},file_size={file_size}]")
             await bot.send_group_msg(group_id=group_id, message=f"文件 {file_name} 已成功转移到群 {free_group_id}！") # type: ignore
             # if message_id :
             #     # 记录转移后的消息ID和时间戳，后续用于自动刷新
@@ -234,13 +235,14 @@ async def handle_group_upload(bot: Bot, event: Event ):  # noqa: C901
         file_size = event.file.size # type: ignore
 
         current_qpan_info = await get_qpan_file_info(bot, group_id) # type: ignore # 获取当前群盘信息以计算剩余空间
-        await file_upload.send(f"检测到群 {group_id} 中用户 {user_id} 上传了文件 {file_name}，大小为 {file_size} 字节，file_id: {event.file.id}，当前群盘使用率：{int(current_qpan_info.used_space/current_qpan_info.total_space * 100)}% ，是否足够？ {current_qpan_info.total_space - current_qpan_info.used_space >= file_size}") # type: ignore # 发送通知消息
+        await file_upload.send(f"检测到群 {group_id} 中用户 {user_id} 上传了文件 {file_name}，大小为 {file_size} 字节，当前群盘使用率：{int(current_qpan_info.used_space/current_qpan_info.total_space * 100)}% ，是否足够？ {current_qpan_info.total_space - current_qpan_info.used_space >= file_size}") # type: ignore # 发送通知消息
 
         if file_id := event.file.id: # type: ignore # 获取上传文件的 file_id
-            if file_id not in file_messages: # type: ignore
-                await file_upload.send(f"file_id={file_id} 的记录尚未更新到 file_messages 中，可能尚未捕获到消息事件，稍后将自动刷新")
+            file_msg = _find_file_message(file_id)
+            if file_msg is None:
+                await file_upload.send("该文件的 uid 记录尚未更新到 file_messages 中，可能尚未捕获到消息事件，稍后将自动刷新")
             else:
-                await file_upload.send(f"file_id={file_id} 的记录已存在于 file_messages 中，message_id={file_messages[file_id]['message_id']}") # type: ignore
+                await file_upload.send(f"该文件已生成 uid={file_msg.get('uid')}，message_id={file_msg.get('message_id')}") # type: ignore
 
         files = await get_qpan_files(bot) # type: ignore # 刷新文件列表，确保 file_messages 中有最新的记录
         for file in files:
@@ -290,7 +292,14 @@ async def handle_group_upload(bot: Bot, event: Event ):  # noqa: C901
 qpan = on_command("qpan", aliases={"群盘"} , priority=5) # 定义一个命令处理器，监听 "qpan" 和 "群盘" 命令，优先级为 5
 
 async def cmd_help(bot, event, sub_args):
-    await qpan.finish("可用子命令：help, list, search ...")
+    await qpan.finish("可用子命令：help, list, search, get <uid|/file_id> ...\n示例：\n  qpan get <uid>          （通过 uid 查询已记录文件）\n  qpan get /<file_id>     （通过 file_id 查询，若未记录则自动下载重新上传）")
+
+
+def _uid_by_file(file_id: str, group_id: int, file_name: str, file_size: int) -> str:
+    record = _find_file_message(file_id)
+    if record is None:
+        record = _find_file_message_by_signature(group_id, file_name, file_size)
+    return str(record.get("uid")) if record is not None else "-"
 
 async def cmd_list(bot, event, sub_args):
     # 解析参数：sub_args[0] = 页码, sub_args[1] = 筛选条件(0=非永久, 1=永久)
@@ -319,7 +328,10 @@ async def cmd_list(bot, event, sub_args):
     paginated_files = file_list[start_index:end_index]
 
     filter_desc = "全部" if filter_permanent is None else ("永久" if filter_permanent else "非永久")
-    file_info_list = "\n".join(f"{file['file_name']} \n(大小: {file['file_size']/1024/1024:.2f} MB ，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , file_id: {file['file_id']})" for file in paginated_files)
+    file_info_list = "\n".join(
+        f"{file['file_name']} \n(大小: {file['file_size']/1024/1024:.2f} MB ，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , uid: {_uid_by_file(file['file_id'], file['group_id'], file['file_name'], file['file_size'])})"
+        for file in paginated_files
+    )
 
     await qpan.finish(f"文件列表（{filter_desc}）：\n{file_info_list}\n共 {len(file_list)} 个文件 \n 第 {page} / {all_page} 页")
 
@@ -329,7 +341,13 @@ async def cmd_search(bot, event, sub_args):
 
     matching_files = [f for f in file_list if keyword in f["file_name"]]
 
-    await qpan.finish(f"搜索：{keyword}，找到 {len(matching_files)} 个文件：\n" + "\n".join(f"{file['file_name']} (大小: {file['file_size']/1024/1024:.2f} MB，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , file_id: {file['file_id']})" for file in matching_files))
+    await qpan.finish(
+        f"搜索：{keyword}，找到 {len(matching_files)} 个文件：\n"
+        + "\n".join(
+            f"{file['file_name']} (大小: {file['file_size']/1024/1024:.2f} MB，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , uid: {_uid_by_file(file['file_id'], file['group_id'], file['file_name'], file['file_size'])})"
+            for file in matching_files
+        )
+    )
 
 async def cmd_info(bot, event, sub_args):
     # qpan_info = await get_qpan_file_info(bot) # type: ignore
@@ -359,7 +377,7 @@ async def cmd_info(bot, event, sub_args):
         )
 
 async def cmd_remove(bot, event, sub_args):
-    # 只提供file_id参数，后续可以增加更多的参数来提高准确性，例如文件名、大小、所属群等
+    # 只提供 uid 参数，后续可以增加更多参数来提高准确性，例如文件名、大小、所属群等
     sub_args[0] if sub_args else ""
     await qpan.finish("删除功能尚未实现")
 
@@ -369,14 +387,59 @@ async def cmd_refresh(bot, event, sub_args):
     await qpan.finish("刷新完成")
 
 async def cmd_get(bot, event, sub_args):
-    file_id = sub_args[0] if sub_args else ""
-    file_list = await get_qpan_files(bot) # type: ignore
-    target_file = next((f for f in file_list if f["file_id"] == file_id), None) # type: ignore # next函数会返回第一个满足条件的文件对象，如果没有找到则返回None
-    if target_file:
-        await qpan.send(f"正在发送文件 {target_file['file_name']} 到当前群！") # type: ignore
-        await send_file_to_group(bot, event.group_id, target_file["file_id"]) # type: ignore
+    identifier = sub_args[0] if sub_args else ""
+    if not identifier:
+        await qpan.finish("请提供 uid 或 file_id（file_id 以 / 开头），示例：qpan get <uid> 或 qpan get /<file_id>")
+        return
+
+    # 判断是 file_id 还是 uid（file_id 以 / 开头）
+    if identifier.startswith("/"):
+        # 用户提供的是 file_id
+        file_id = identifier
+        file_list = await get_qpan_files(bot) # type: ignore
+        target_file = next((f for f in file_list if f["file_id"] == file_id), None) # type: ignore
+
+        if target_file:
+            await qpan.send(f"正在发送文件 {target_file['file_name']} 到当前群！(file_id: {file_id})") # type: ignore
+            await send_file_to_group(bot, event.group_id, file_id) # type: ignore
+        else:
+            # 文件不在程序记录中，启用下载并重新上传的流程
+            await qpan.send(f"文件 {file_id} 未在程序记录中，准备启用下载并重新上传流程...") # type: ignore
+            asyncio.create_task(transfer_file_to_free_group(bot, file_id, event.group_id, file_id, 0)) # type: ignore
+            await qpan.finish("已启动后台转移任务，请稍候...")
     else:
-        await qpan.finish("未找到指定文件")
+        # 用户提供的是 uid
+        uid = identifier
+        record = _find_file_message_by_uid(uid)
+        if record is None:
+            await qpan.finish("未找到指定 uid 的文件记录")
+            return
+
+        file_id = str(record.get("file_id", ""))
+        file_list = await get_qpan_files(bot) # type: ignore
+        target_file = next((f for f in file_list if f["file_id"] == file_id), None) # type: ignore # next函数会返回第一个满足条件的文件对象，如果没有找到则返回None
+
+        # file_id 可能变化，按历史特征回查并更新到最新 file_id
+        if target_file is None:
+            target_file = next(
+                (
+                    f for f in file_list
+                    if f["group_id"] == _as_int(record.get("group_id", 0))
+                    and f["file_name"] == record.get("file_name")
+                    and f["file_size"] == _as_int(record.get("file_size", 0))
+                ),
+                None,
+            )
+            if target_file is not None:
+                record["file_id"] = target_file["file_id"]
+                record["timestamp"] = time.time()
+                _save_file_messages()
+
+        if target_file:
+            await qpan.send(f"正在发送文件 {target_file['file_name']} 到当前群！(uid: {uid})") # type: ignore
+            await send_file_to_group(bot, event.group_id, target_file["file_id"]) # type: ignore
+        else:
+            await qpan.finish("未找到指定文件，可能已被删除或 file_id 尚未同步")
 
 
 SUB_COMMANDS = {
@@ -417,17 +480,116 @@ REFRESH_AFTER_DAYS = 0.5    # 消息超过几天则重新转发刷新
 # REFRESH_INTERVAL_HOURS = 0.0038 # 每隔多少小时检查一次
 # REFRESH_AFTER_DAYS = 0    # test 设置为0表示每条消息都刷新，实际使用时建议设置为3天以上，避免频繁刷新导致的性能问题和可能的频率限制
 
-def _load_file_messages() -> dict[str, dict]:
+def _load_file_messages() -> list[dict[str, object]]:
     try:
         with open(FILE_MESSAGES_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        # 兼容旧格式（直接存储整数 message_id）
-        return {
-            fid: (info if isinstance(info, dict) else {"message_id": info, "timestamp": 0.0, "group_id": 0})
-            for fid, info in data.items()
-        }
+        # 兼容旧格式：
+        # 1) {file_id: {...}} 的字典映射
+        # 2) {file_id: message_id} 的简化映射
+        # 3) [{file_id: ..., ...}] 的新格式列表
+        if isinstance(data, dict):
+            records: list[dict[str, object]] = []
+            for fid, info in data.items():
+                if isinstance(info, dict):
+                    record = dict(info)
+                    record["file_id"] = str(record.get("file_id", fid))
+                else:
+                    record = {
+                        "file_id": str(fid),
+                        "message_id": int(info),
+                        "timestamp": 0.0,
+                        "group_id": 0,
+                        "uid": shortuuid.uuid(),
+                        "file_size": 0,
+                    }
+                records.append(record)
+            return records
+        if isinstance(data, list):
+            records = [r for r in data if isinstance(r, dict) and "file_id" in r]
+            for record in records:
+                record.setdefault("timestamp", 0.0)
+                record.setdefault("group_id", 0)
+                uid = str(record.get("uid", ""))
+                record["uid"] = uid if uid and uid != "0" else shortuuid.uuid()
+                record.setdefault("file_size", 0)
+            return records
+        return []
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        return []
+
+
+def _find_file_message(file_id: str) -> dict[str, object] | None:
+    return next((item for item in file_messages if item.get("file_id") == file_id), None)
+
+
+def _find_file_message_by_uid(uid: str) -> dict[str, object] | None:
+    return next((item for item in file_messages if item.get("uid") == uid), None)
+
+
+def _find_file_message_by_signature(group_id: int, file_name: str, file_size: int) -> dict[str, object] | None:
+    return next(
+        (
+            item for item in reversed(file_messages)
+            if _as_int(item.get("group_id", 0)) == group_id
+            and str(item.get("file_name", "")) == file_name
+            and _as_int(item.get("file_size", 0)) == file_size
+        ),
+        None,
+    )
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float, str)):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _upsert_file_message(file_id: str, message_id: int, group_id: int, file_name: str, file_size: int) -> None:
+    existing = _find_file_message(file_id)
+    if existing is None:
+        # file_id 会变，按文件特征复用既有 uid
+        existing = _find_file_message_by_signature(group_id, file_name, file_size)
+
+    now = time.time()
+    payload = {
+        "file_id": file_id,
+        "message_id": message_id,
+        "timestamp": now,
+        "group_id": group_id,
+        "uid": str(existing.get("uid")) if existing is not None else shortuuid.uuid(),
+        "file_name": file_name,
+        "file_size": file_size,
+    }
+    if existing is not None:
+        existing.update(payload)
+    else:
+        file_messages.append(payload)
+
+    # 超出上限时删除最旧记录
+    if len(file_messages) > FILE_MESSAGES_MAX:
+        file_messages.sort(key=lambda x: _as_float(x.get("timestamp", 0.0)))
+        del file_messages[: len(file_messages) - FILE_MESSAGES_MAX]
 
 def _save_file_messages() -> None:
     with open(FILE_MESSAGES_PATH, "w", encoding="utf-8") as f:
@@ -436,18 +598,21 @@ def _save_file_messages() -> None:
 async def _do_refresh_file_messages() -> None:
     """将超过 REFRESH_AFTER_DAYS 天的记录重新转发到原群，handle_message 会自动更新 timestamp"""
     try:
-        from nonebot import get_bot  # noqa: PLC0415
+        from nonebot import get_bot
         bot = get_bot()
     except Exception:
         print("刷新文件消息：未找到可用的 bot 实例")
         return
     now = time.time()
-    expired = [(fid, info) for fid, info in list(file_messages.items())
-               if now - info.get("timestamp", 0) > REFRESH_AFTER_DAYS * 86400]
+    expired = [
+        info for info in file_messages
+        if now - _as_float(info.get("timestamp", 0)) > REFRESH_AFTER_DAYS * 86400
+    ]
     if not expired:
         return
     print(f"开始刷新 {len(expired)} 条过期文件消息...")
-    for file_id, info in expired:
+    for info in expired:
+        file_id = str(info.get("file_id", ""))
         if not info.get("group_id"):
             print(f"跳过 file_id={file_id}：无有效 group_id")
             continue
@@ -478,7 +643,7 @@ driver = get_driver()
 async def _start_refresh_task() -> None:
     asyncio.create_task(_refresh_loop())
 
-file_messages: dict[str, dict] = _load_file_messages()  # file_id -> {message_id, timestamp, group_id}
+file_messages: list[dict[str, object]] = _load_file_messages()  # uid -> file metadata
 
 
 def _record_file_message(raw_message: str , message_id: int , group_id: int) -> None:
@@ -493,16 +658,9 @@ def _record_file_message(raw_message: str , message_id: int , group_id: int) -> 
             print(f"提取到 file_id：{file_id}")
             file_name_match = re.search(r"(?<!\w)file=([^,\]]+)", raw_message)
             file_name = file_name_match.group(1) if file_name_match else ""
-            if len(file_messages) >= FILE_MESSAGES_MAX:
-                # 超出上限时删除最旧的一条
-                oldest_key = next(iter(file_messages))
-                del file_messages[oldest_key]
-            file_messages[file_id] = {
-                "message_id": message_id,
-                "timestamp": time.time(),
-                "group_id": group_id,
-                "file_name": file_name,
-            }
+            file_size_match = re.search(r"file_size=(\d+)", raw_message)
+            file_size = int(file_size_match.group(1)) if file_size_match else 0
+            _upsert_file_message(file_id, message_id, group_id, file_name, file_size)
             _save_file_messages()
             # await msg.send(f"已记录文件消息，file_id: {file_id}，message_id: {event.message_id}") # type: ignore
         # await bot.forward_group_single_msg(group_id=event.group_id, message_id=event.message_id) # type: ignore # 尝试将消息转发到另一个群，替换为实际的目标群ID
@@ -510,8 +668,8 @@ def _record_file_message(raw_message: str , message_id: int , group_id: int) -> 
 
 @msg.handle()
 async def handle_message(bot: Bot, event: Event):
-    user_id = getattr(event, "user_id", None)
-    is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
+    # user_id = getattr(event, "user_id", None)
+    # is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
     # print(f"message 事件触发 (self={is_self_message})")
     _record_file_message(event.raw_message, event.message_id, event.group_id) # type: ignore
 
@@ -520,8 +678,8 @@ async def handle_message(bot: Bot, event: Event):
 async def handle_self_message(bot: Bot, event: Event):
     if event.post_type != "message_sent":
         return
-    user_id = getattr(event, "user_id", None)
-    is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
+    # user_id = getattr(event, "user_id", None)
+    # is_self_message = user_id is not None and str(user_id) == str(bot.self_id)
     # print(f"message_sent 事件触发 (self={is_self_message})")
     _record_file_message(event.raw_message, event.message_id, event.group_id) # type: ignore
 
