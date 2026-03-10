@@ -10,6 +10,7 @@ import httpx
 import shortuuid
 from nonebot import get_driver, on, on_command, on_message, on_notice
 from nonebot.adapters.onebot.v11 import Bot, Event, Message
+from nonebot.exception import FinishedException
 from nonebot.params import CommandArg
 from nonebot.typing import T_State
 from pypinyin import Style, lazy_pinyin
@@ -292,7 +293,25 @@ async def handle_group_upload(bot: Bot, event: Event ):  # noqa: C901
 qpan = on_command("qpan", aliases={"群盘"} , priority=5) # 定义一个命令处理器，监听 "qpan" 和 "群盘" 命令，优先级为 5
 
 async def cmd_help(bot, event, sub_args):
-    await qpan.finish("可用子命令：help, list, search, get <uid|/file_id> ...\n示例：\n  qpan get <uid>          （通过 uid 查询已记录文件）\n  qpan get /<file_id>     （通过 file_id 查询，若未记录则自动下载重新上传）")
+    await qpan.finish(
+        "可用子命令：\n"
+        "  help/帮助          - 显示本帮助\n"
+        "  list/列表 [页码] [0/1] - 分页列表（0=非永久,1=永久）\n"
+        "  search/搜索 <关键词> - 按文件名搜索\n"
+        "  info/总盘          - 查看空间统计\n"
+        "  get/获取 <uid|/file_id> - 转发文件到当前群\n"
+        "  remove/删除 <uid|/file_id|all> - 删除文件\n"
+        "  refresh/刷新       - 手动刷新过期记录\n\n"
+        "示例：\n"
+        "  qpan list\n"
+        "  qpan search 报告\n"
+        "  qpan get abc123xyz （通过uid）\n"
+        "  qpan get /ac730bb9... （通过file_id，以/开头）\n"
+        "  qpan remove abc123xyz （删除uid）\n"
+        "  qpan remove /ac730bb9... （删除file_id）\n"
+        "  qpan remove all nonpermanent （删除所有非永久文件）\n"
+        "  qpan remove all repeated （删除所有重复文件）"
+    )
 
 
 def _uid_by_file(file_id: str, group_id: int, file_name: str, file_size: int) -> str:
@@ -329,7 +348,7 @@ async def cmd_list(bot, event, sub_args):
 
     filter_desc = "全部" if filter_permanent is None else ("永久" if filter_permanent else "非永久")
     file_info_list = "\n".join(
-        f"{file['file_name']} \n(大小: {file['file_size']/1024/1024:.2f} MB ，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , uid: {_uid_by_file(file['file_id'], file['group_id'], file['file_name'], file['file_size'])})"
+        f"{file['file_name']} \n(大小: {file['file_size']/1024/1024:.2f} MB ，属于群 {file['group_name']} , 是否永久 {file['dead_time'] == 0} , file_id: {file['file_id']} , uid: {_uid_by_file(file['file_id'], file['group_id'], file['file_name'], file['file_size'])})"
         for file in paginated_files
     )
 
@@ -376,7 +395,7 @@ async def cmd_info(bot, event, sub_args):
         f"\n共 {qpan_info.group_count} 个群盘，平均每个群盘使用空间：{(qpan_info.used_space/qpan_info.group_count)/1024/1024/1024:.2f} GB"
         )
 
-async def cmd_remove(bot, event, sub_args):
+async def cmd_remove_old(bot, event, sub_args):
     # 只提供 uid 参数，后续可以增加更多参数来提高准确性，例如文件名、大小、所属群等
     sub_args[0] if sub_args else ""
     await qpan.finish("删除功能尚未实现")
@@ -385,6 +404,12 @@ async def cmd_refresh(bot, event, sub_args):
     await qpan.send(f"开始刷新，共 {len(file_messages)} 条记录，超过 {REFRESH_AFTER_DAYS} 天的将被重新转发...")
     await _do_refresh_file_messages()
     await qpan.finish("刷新完成")
+
+async def cmd_resend(bot, event, sub_args):
+    """触发后台任务：扫描群盘文件并补充未被记录的文件"""
+    await qpan.send("开始补充文件记录，将在后台执行...")
+    asyncio.create_task(_resend_all_file_norecord(bot))
+    await qpan.finish("后台任务已启动，请稍候")
 
 async def cmd_get(bot, event, sub_args):
     identifier = sub_args[0] if sub_args else ""
@@ -441,6 +466,153 @@ async def cmd_get(bot, event, sub_args):
         else:
             await qpan.finish("未找到指定文件，可能已被删除或 file_id 尚未同步")
 
+async def cmd_remove(bot, event, sub_args):
+    """删除文件，支持按uid、按file_id或删除所有特定类型文件"""
+    if not sub_args:
+        await qpan.finish("请提供删除参数，例如：qpan remove <uid|/file_id> 或 qpan remove all nonpermanent/repeated")
+        return
+
+    # 模式1：按 file_id 删除（以 "/" 开头）
+    if sub_args[0].startswith("/"):
+        file_id = sub_args[0]
+        record = _find_file_message(file_id)
+        
+        # 当记录中找不到时，直接从群文件列表搜索
+        if record is None:
+            file_list = await get_qpan_files(bot)  # type: ignore
+            target_file = next((f for f in file_list if f["file_id"] == file_id), None)  # type: ignore
+            
+            if target_file is None:
+                await qpan.finish(f"未找到 file_id={file_id} 的文件")
+                return
+            
+            # 文件存在于群盘中但无记录，直接删除
+            try:
+                await bot.delete_group_file(group_id=target_file["group_id"], file_id=file_id)  # type: ignore
+                await qpan.finish(f"已删除文件 {target_file['file_name']}（file_id: {file_id}）")  # type: ignore
+                return
+            except FinishedException:
+                raise
+            except Exception as e:
+                await qpan.finish(f"删除文件失败：{e}\n文件：{target_file['file_name']}")  # type: ignore
+            return
+        
+        # 如果记录存在，从记录和群文件中都删除
+        file_messages.remove(record)
+        _save_file_messages()
+
+        group_id = _as_int(record.get("group_id"))
+        file_name = str(record.get("file_name", "未知文件"))
+        try:
+            await bot.delete_group_file(group_id=group_id, file_id=file_id)  # type: ignore
+            await qpan.finish(f"已删除文件 {file_name}（file_id: {file_id}）")
+        except FinishedException:
+            raise
+        except Exception as e:
+            await qpan.finish(f"已从记录中删除，但群文件删除失败：{e}\n文件：{file_name}")
+
+    # 模式2：按 uid 删除
+    elif sub_args[0] != "all":
+        uid = sub_args[0]
+        record = _find_file_message_by_uid(uid)
+        if record is None:
+            await qpan.finish(f"未找到 uid={uid} 的文件记录")
+            return
+
+        file_id = str(record.get("file_id", ""))
+        file_name = str(record.get("file_name", "未知文件"))
+        group_id = _as_int(record.get("group_id"))
+
+        # 从记录中删除
+        file_messages.remove(record)
+        _save_file_messages()
+
+        # 尝试从群文件中删除
+        try:
+            await bot.delete_group_file(group_id=group_id, file_id=file_id)  # type: ignore
+            await qpan.finish(f"已删除文件 {file_name}（uid: {uid}）")
+        except FinishedException:
+            raise
+        except Exception as e:
+            await qpan.finish(f"已从记录中删除，但群文件删除失败：{e}\n文件：{file_name}")
+
+    # 模式3：删除所有特定类型文件
+    elif sub_args[0] == "all":
+        if len(sub_args) < 2:
+            await qpan.finish("请指定删除类型：qpan remove all nonpermanent（非永久）或 qpan remove all repeated（重复）")
+            return
+
+        sub_cmd = sub_args[1]
+
+        # 删除所有非永久文件
+        if sub_cmd == "nonpermanent":
+            file_list = await get_qpan_files(bot)  # type: ignore
+            # 找出所有非永久文件（dead_time != 0）
+            nonpermanent_files = [f for f in file_list if f.get("dead_time", 0) != 0]  # type: ignore
+
+            if not nonpermanent_files:
+                await qpan.finish("没有找到非永久文件")
+                return
+
+            deleted_count = 0
+            failed_count = 0
+            for file in nonpermanent_files:
+                try:
+                    await bot.delete_group_file(group_id=file["group_id"], file_id=file["file_id"])  # type: ignore
+                    # 从记录中删除
+                    record = _find_file_message(file["file_id"])  # type: ignore
+                    if record:
+                        file_messages.remove(record)
+                    deleted_count += 1
+                    await asyncio.sleep(0.3)  # 避免频率限制
+                except FinishedException:
+                    raise
+                except Exception as e:  # noqa: PERF203
+                    print(f"删除文件 {file['file_name']} 失败：{e}")  # type: ignore
+                    failed_count += 1
+
+            _save_file_messages()
+            await qpan.finish(f"已删除 {deleted_count} 个非永久文件，失败 {failed_count} 个")
+
+        # 删除所有重复文件
+        elif sub_cmd == "repeated":
+            file_list = await get_qpan_files(bot)  # type: ignore
+            # 按文件名和大小分组，找出重复的
+            seen = {}  # (file_name, file_size) -> 第一个文件对象
+            duplicates = []
+
+            for file in file_list:
+                key = (file["file_name"], file["file_size"])  # type: ignore
+                if key in seen:
+                    duplicates.append(file)
+                else:
+                    seen[key] = file
+
+            if not duplicates:
+                await qpan.finish("没有找到重复文件")
+                return
+
+            deleted_count = 0
+            failed_count = 0
+            for file in duplicates:
+                try:
+                    await bot.delete_group_file(group_id=file["group_id"], file_id=file["file_id"])  # type: ignore
+                    # 从记录中删除
+                    record = _find_file_message(file["file_id"])  # type: ignore
+                    if record:
+                        file_messages.remove(record)
+                    deleted_count += 1
+                    await asyncio.sleep(0.3)  # 避免频率限制
+                except FinishedException:
+                    raise
+                except Exception as e:  # noqa: PERF203
+                    print(f"删除文件 {file['file_name']} 失败：{e}")  # type: ignore
+                    failed_count += 1
+
+            _save_file_messages()
+            await qpan.finish(f"已删除 {deleted_count} 个重复文件，失败 {failed_count} 个")
+        else:
+            await qpan.finish(f"未知的删除类型：{sub_cmd}，请使用 nonpermanent 或 repeated")
 
 SUB_COMMANDS = {
     "help": cmd_help, "帮助": cmd_help,
@@ -448,9 +620,10 @@ SUB_COMMANDS = {
     "search": cmd_search, "搜索": cmd_search,
     "info" : cmd_info, "总盘" : cmd_info ,
     "set" : None, "设置" : None, # 预留设置命令
-    "remove" : None, "删除" : None, # 预留删除命令
+    "remove" : cmd_remove, "删除" : cmd_remove, # 预留删除命令
     "get" : cmd_get , "获取" : cmd_get , # 预留获取文件命令
     "refresh" : cmd_refresh , "刷新" : cmd_refresh , # 手动触发消息刷新
+    "resend" : cmd_resend , # 后台补充未记录的文件
 }
 
 @qpan.handle()
@@ -479,6 +652,8 @@ REFRESH_AFTER_DAYS = 0.5    # 消息超过几天则重新转发刷新
 
 # REFRESH_INTERVAL_HOURS = 0.0038 # 每隔多少小时检查一次
 # REFRESH_AFTER_DAYS = 0    # test 设置为0表示每条消息都刷新，实际使用时建议设置为3天以上，避免频繁刷新导致的性能问题和可能的频率限制
+
+
 
 def _load_file_messages() -> list[dict[str, object]]:
     try:
@@ -637,10 +812,69 @@ async def _refresh_loop() -> None:
         # else:
         #     print(f"距离下次刷新还有 {(REFRESH_INTERVAL_HOURS * 3600 - (time.time() - last_refresh)) / 60:.2f} 分钟")
 
+# 遍历群盘文件，并与本地记录对比，找出未被记录的或uid丢失的文件，补充记录到 file_messages 中
+async def _resend_all_file_norecord(bot : Bot) -> None:
+    """遍历群盘文件，找出未记录或uid丢失的文件，补充记录"""
+    try:
+        files = await get_qpan_files(bot)  # type: ignore
+        if not files:
+            print("群盘中没有文件")
+            return
+
+        updated_count = 0
+        for file in files:
+            file_id = file.get("file_id", "")
+            if not file_id:
+                continue
+
+            # 查找是否已有记录
+            record = _find_file_message(file_id)
+
+            # 如果没有记录，或者 uid 丢失，则需补充/更新
+            if record is None or not str(record.get("uid", "")).strip():
+                # 按文件特征匹配现有 uid（文件移动的情况）
+                existing_by_sig = _find_file_message_by_signature(
+                    _as_int(file.get("group_id", 0)),
+                    file.get("file_name", ""),
+                    _as_int(file.get("file_size", 0))
+                )
+
+                # 由用旧 uid 或生成新 uid
+                uid = str(existing_by_sig.get("uid")) if existing_by_sig is not None else shortuuid.uuid()
+
+                # 構建新记录
+                payload = {
+                    "file_id": file_id,
+                    "message_id": _as_int(record.get("message_id", 0)) if record else 0,  # 保留旧消息 ID（如果不有则设为 0）
+                    "timestamp": time.time(),
+                    "group_id": _as_int(file.get("group_id", 0)),
+                    "uid": uid,
+                    "file_name": file.get("file_name", ""),
+                    "file_size": _as_int(file.get("file_size", 0)),
+                }
+
+                if record is not None:
+                    # 更新现有记录
+                    record.update(payload)
+                else:
+                    # 添加新记录
+                    file_messages.append(payload)
+
+                updated_count += 1
+
+        if updated_count > 0:
+            _save_file_messages()
+            print(f"补充文件记录完成，更新了 {updated_count} 条记录，共 {len(file_messages)} 条")
+        else:
+            print("所有群盘文件都已有有效记录")
+    except Exception as e:
+        print(f"补充文件记录失败：{e}")
+
 driver = get_driver()
 
 @driver.on_startup
 async def _start_refresh_task() -> None:
+    # asyncio.create_task(_resend_all_file_norecord())
     asyncio.create_task(_refresh_loop())
 
 file_messages: list[dict[str, object]] = _load_file_messages()  # uid -> file metadata
