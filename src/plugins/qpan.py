@@ -301,7 +301,8 @@ async def cmd_help(bot, event, sub_args):
         "  info/总盘          - 查看空间统计\n"
         "  get/获取 <uid|/file_id> - 转发文件到当前群\n"
         "  remove/删除 <uid|/file_id|all> - 删除文件\n"
-        "  refresh/刷新       - 手动刷新过期记录\n\n"
+        "  refresh/刷新       - 手动刷新过期记录\n"
+        "  resend             - 补充未记录的群盘文件（后台执行）\n\n"
         "示例：\n"
         "  qpan list\n"
         "  qpan search 报告\n"
@@ -310,7 +311,8 @@ async def cmd_help(bot, event, sub_args):
         "  qpan remove abc123xyz （删除uid）\n"
         "  qpan remove /ac730bb9... （删除file_id）\n"
         "  qpan remove all nonpermanent （删除所有非永久文件）\n"
-        "  qpan remove all repeated （删除所有重复文件）"
+        "  qpan remove all repeated （删除所有重复文件）\n"
+        "  qpan resend （扫描并补充未被记录的文件）"
     )
 
 
